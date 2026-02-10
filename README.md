@@ -38,6 +38,10 @@ A simple MCP server that will proxy to a grpc backend based on a provided descri
 
 * `header` string (repeatable) - Headers to add in `Key: Value` format.
 
+* `short-names` - Use short tool names (`ServiceName__MethodName` instead of full package path). Falls back to the full path if two services share the same simple name.
+
+* `very-short-names` - Use very short tool names (`MethodName` only, no service prefix). Falls back to `ServiceName__MethodName` if method names collide across services, and to the full path if service names also collide.
+
 * `require-method-option` string - Only expose methods where a specific proto method option matches a given value. Format: `fieldNumber:value` (e.g. `50003:1`). This filters gRPC methods by checking the raw proto extension field on the method descriptor, so no generated code for the option is needed.
 
 ## Help

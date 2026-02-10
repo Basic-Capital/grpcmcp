@@ -117,8 +117,11 @@ func (s *headerFlags) Set(value string) error {
 	return nil
 }
 
-func generateToolName(shortNames bool, hasCollision bool, fullServiceName string, simpleServiceName string, methodName string) string {
-	if shortNames && !hasCollision {
+func generateToolName(shortNames bool, veryShortNames bool, hasShortCollision bool, hasVeryShortCollision bool, fullServiceName string, simpleServiceName string, methodName string) string {
+	if veryShortNames && !hasVeryShortCollision {
+		return methodName
+	}
+	if (shortNames || veryShortNames) && !hasShortCollision {
 		return fmt.Sprintf("%v__%v", simpleServiceName, methodName)
 	}
 	return strings.ReplaceAll(fmt.Sprintf("%v__%v", fullServiceName, methodName), ".", "_")
@@ -197,6 +200,7 @@ func main() {
 	useConnect := flag.Bool("connect", false, "Use connect protocol (instead of gRPC)")
 	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value, e.g. 50003:1)")
 	shortNames := flag.Bool("short-names", false, "Use short tool names (ServiceName__MethodName instead of full package path). Saves tokens when used with LLM agents that list all tool names in context.")
+	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
 
 	flag.Parse()
 
@@ -299,10 +303,12 @@ func main() {
 		}
 	}
 
-	// Pre-scan for duplicate simple service names so --short-names can fall back
-	// to the full name for any services that would collide.
+	// Pre-scan for collisions so --short-names / --very-short-names can fall back.
+	// simpleNameCount: how many services share the same simple name (for --short-names)
+	// methodNameCount: how many services define the same method name (for --very-short-names)
 	simpleNameCount := map[string]int{}
-	if *shortNames {
+	methodNameCount := map[string]int{}
+	if *shortNames || *veryShortNames {
 		scanReg := buildRegistry(&fds)
 		scanReg.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
 			for i := range fd.Services().Len() {
@@ -313,6 +319,24 @@ func main() {
 					}
 				}
 				simpleNameCount[string(s.Name())]++
+				if *veryShortNames {
+					// Count how many services define each method name.
+					// If two services both have "GetPlan", that method can't use
+					// the method-only format (e.g. "GetPlan") and must fall back
+					// to include the service prefix (e.g. "WalletService__GetPlan").
+					// We skip streaming and filtered-out methods to match the actual
+					// set of tools that will be registered.
+					for j := range s.Methods().Len() {
+						m := s.Methods().Get(j)
+						if m.IsStreamingClient() || m.IsStreamingServer() {
+							continue
+						}
+						if optFieldNum > 0 && !hasMethodOption(m, optFieldNum, optValue) {
+							continue
+						}
+						methodNameCount[string(m.Name())]++
+					}
+				}
 			}
 			return true
 		})
@@ -359,8 +383,9 @@ func main() {
 				description := strings.Join(descriptions, " | ")
 				c := connect.NewClient[dynamicpb.Message, dynamicpb.Message](httpClient, *baseURL+procedure, connect.WithSchema(m), connect.WithClientOptions(connectOpts...))
 
-				hasCollision := simpleNameCount[string(s.Name())] > 1
-				name := generateToolName(*shortNames, hasCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
+				hasShortCollision := simpleNameCount[string(s.Name())] > 1
+				hasVeryShortCollision := methodNameCount[string(m.Name())] > 1
+				name := generateToolName(*shortNames, *veryShortNames, hasShortCollision, hasVeryShortCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
 				srv.AddTool(mcp.NewToolWithRawSchema(name, description, rawJson), toolHandler(c, m.Input(), http.Header(headers)))
 			}
 		}

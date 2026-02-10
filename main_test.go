@@ -92,7 +92,7 @@ func TestToolNameGeneration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := generateToolName(tt.shortNames, false, tt.pkg+"."+tt.service, tt.service, string(tt.method))
+			got := generateToolName(tt.shortNames, false, false, false, tt.pkg+"."+tt.service, tt.service, string(tt.method))
 			if got != tt.wantName {
 				t.Errorf("generateToolName() = %q, want %q", got, tt.wantName)
 			}
@@ -101,11 +101,57 @@ func TestToolNameGeneration(t *testing.T) {
 }
 
 func TestToolNameCollisionFallback(t *testing.T) {
-	// When collision is detected, even with shortNames=true, should use full name
-	got := generateToolName(true, true, "com.example.pkg1.FooService", "FooService", "GetBar")
+	// When short-name collision is detected, even with shortNames=true, should use full name
+	got := generateToolName(true, false, true, false, "com.example.pkg1.FooService", "FooService", "GetBar")
 	want := "com_example_pkg1_FooService__GetBar"
 	if got != want {
 		t.Errorf("generateToolName() with collision = %q, want %q", got, want)
+	}
+}
+
+func TestVeryShortNames(t *testing.T) {
+	tests := []struct {
+		name                  string
+		hasShortCollision     bool
+		hasVeryShortCollision bool
+		fullServiceName       string
+		simpleServiceName     string
+		methodName            string
+		wantName              string
+	}{
+		{
+			name:              "method-only when no collision",
+			fullServiceName:   "com.example.wallet.WalletService",
+			simpleServiceName: "WalletService",
+			methodName:        "GetPlan",
+			wantName:          "GetPlan",
+		},
+		{
+			name:                  "falls back to service__method when method name collides",
+			hasVeryShortCollision: true,
+			fullServiceName:       "com.example.wallet.WalletService",
+			simpleServiceName:     "WalletService",
+			methodName:            "GetPlan",
+			wantName:              "WalletService__GetPlan",
+		},
+		{
+			name:                  "falls back to full name when both method and service name collide",
+			hasShortCollision:     true,
+			hasVeryShortCollision: true,
+			fullServiceName:       "com.example.wallet.WalletService",
+			simpleServiceName:     "WalletService",
+			methodName:            "GetPlan",
+			wantName:              "com_example_wallet_WalletService__GetPlan",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := generateToolName(false, true, tt.hasShortCollision, tt.hasVeryShortCollision, tt.fullServiceName, tt.simpleServiceName, tt.methodName)
+			if got != tt.wantName {
+				t.Errorf("generateToolName() = %q, want %q", got, tt.wantName)
+			}
+		})
 	}
 }
 
