@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -185,6 +186,37 @@ func hasMethodOption(m protoreflect.MethodDescriptor, fieldNum uint32, expectedV
 	return false
 }
 
+func secureTransport(caFile, certFile, keyFile string) (tlsConfig tls.Config, err error) {
+
+	if (keyFile == "") != (certFile == "") {
+		return tlsConfig, fmt.Errorf("Both key and certificate files must be specified")
+	}
+	if caFile != "" {
+		var file []byte
+		file, err = os.ReadFile(caFile)
+		if err != nil {
+			return
+		}
+
+		pool := x509.NewCertPool()
+		ok := pool.AppendCertsFromPEM(file)
+		if !ok {
+			return tlsConfig, fmt.Errorf("Failed to find any certs in ca-file")
+		}
+		tlsConfig.RootCAs = pool
+	}
+
+	if certFile != "" {
+		var cert tls.Certificate
+		cert, err = tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+	return
+}
+
 func main() {
 	headers := make(headerFlags)
 	flag.Var(&headers, "header", "Headers to add to the backend request (Header: Value). Can apply multiple times.")
@@ -198,6 +230,9 @@ func main() {
 	bearerEnv := flag.String("bearer-env", "", "Environment variable for token to use in an Authorization bearer header")
 	baseURL := flag.String("url", "http://localhost:8090", "The url of the backend")
 	useConnect := flag.Bool("connect", false, "Use connect protocol (instead of gRPC)")
+	caFile := flag.String("ca-file", "", "File containing a CA Certificate to trust for HTTPS")
+	keyFile := flag.String("key-file", "", "File containing a TLS Key. Also requires cert-file")
+	certFile := flag.String("cert-file", "", "File containing a TLS Certificate to use for authentication. Also requires key-file")
 	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value, e.g. 50003:1)")
 	shortNames := flag.Bool("short-names", false, "Use short tool names (ServiceName__MethodName instead of full package path). Saves tokens when used with LLM agents that list all tool names in context.")
 	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
@@ -249,11 +284,27 @@ func main() {
 		flag.Usage()
 		os.Exit(-1)
 	}
+	if strings.HasPrefix(*baseURL, "http://") && (*caFile != "" || *keyFile != "" || *certFile != "") {
+		fmt.Fprint(os.Stderr, "Defining TLS options is invalid with an insecure URL")
+		os.Exit(-1)
+	}
 
 	httpClient := http.DefaultClient
+
+	if *caFile != "" || *keyFile != "" || *certFile != "" {
+		tlsConfig, err := secureTransport(*caFile, *certFile, *keyFile)
+		if err != nil {
+			fmt.Fprint(os.Stderr, "Failed to parse TLS options")
+			fmt.Fprint(os.Stderr, err)
+			os.Exit(-1)
+		}
+		httpClient.Transport = &http.Transport{TLSClientConfig: &tlsConfig}
+	}
+
 	if strings.HasPrefix(*baseURL, "http://") {
 		httpClient = insecureClient()
 	}
+
 	var connectOpts []connect.ClientOption
 	connectOpts = append(connectOpts, responseInitializer)
 	if !*useConnect {
