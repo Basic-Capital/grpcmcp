@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -141,7 +142,7 @@ func buildRegistry(fds *descriptorpb.FileDescriptorSet) *protoregistry.Files {
 	return reg
 }
 
-func hasMethodOption(m protoreflect.MethodDescriptor, fieldNum uint32, expectedValue uint64) bool {
+func hasMethodOption(m protoreflect.MethodDescriptor, fieldNum uint32, expectedValues []uint64) bool {
 	opts := m.Options()
 	if opts == nil {
 		return false
@@ -161,7 +162,7 @@ func hasMethodOption(m protoreflect.MethodDescriptor, fieldNum uint32, expectedV
 			if vn < 0 {
 				return false
 			}
-			return v == expectedValue
+			return slices.Contains(expectedValues, v)
 		}
 		switch wtype {
 		case protowire.VarintType:
@@ -198,18 +199,18 @@ func main() {
 	bearerEnv := flag.String("bearer-env", "", "Environment variable for token to use in an Authorization bearer header")
 	baseURL := flag.String("url", "http://localhost:8090", "The url of the backend")
 	useConnect := flag.Bool("connect", false, "Use connect protocol (instead of gRPC)")
-	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value, e.g. 50003:1)")
+	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value or fieldNumber:value1,value2, e.g. 50003:1 or 50003:1,2)")
 	shortNames := flag.Bool("short-names", false, "Use short tool names (ServiceName__MethodName instead of full package path). Saves tokens when used with LLM agents that list all tool names in context.")
 	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
 
 	flag.Parse()
 
 	var optFieldNum uint32
-	var optValue uint64
+	var optValues []uint64
 	if *requireMethodOption != "" {
 		parts := strings.SplitN(*requireMethodOption, ":", 2)
 		if len(parts) != 2 {
-			fmt.Fprint(os.Stderr, "require-method-option must be in the format fieldNumber:value\n")
+			fmt.Fprint(os.Stderr, "require-method-option must be in the format fieldNumber:value or fieldNumber:value1,value2\n")
 			os.Exit(-1)
 		}
 		fn, err := strconv.ParseUint(parts[0], 10, 32)
@@ -217,13 +218,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "invalid field number in require-method-option: %v\n", err)
 			os.Exit(-1)
 		}
-		val, err := strconv.ParseUint(parts[1], 10, 64)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid value in require-method-option: %v\n", err)
-			os.Exit(-1)
+		for _, valStr := range strings.Split(parts[1], ",") {
+			val, err := strconv.ParseUint(valStr, 10, 64)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid value in require-method-option: %v\n", err)
+				os.Exit(-1)
+			}
+			optValues = append(optValues, val)
 		}
 		optFieldNum = uint32(fn)
-		optValue = val
 	}
 
 	if *bearerEnv != "" {
@@ -331,7 +334,7 @@ func main() {
 						if m.IsStreamingClient() || m.IsStreamingServer() {
 							continue
 						}
-						if optFieldNum > 0 && !hasMethodOption(m, optFieldNum, optValue) {
+						if optFieldNum > 0 && !hasMethodOption(m, optFieldNum, optValues) {
 							continue
 						}
 						methodNameCount[string(m.Name())]++
@@ -359,7 +362,7 @@ func main() {
 					// Currently don't support streaming
 					continue
 				}
-				if optFieldNum > 0 && !hasMethodOption(m, optFieldNum, optValue) {
+				if optFieldNum > 0 && !hasMethodOption(m, optFieldNum, optValues) {
 					continue
 				}
 				input := buf.Generate(m.Input())

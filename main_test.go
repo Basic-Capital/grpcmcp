@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -45,6 +47,49 @@ func buildEmptyFileDescriptor() *descriptorpb.FileDescriptorProto {
 			},
 		},
 	}
+}
+
+// methodWithVarintOption builds a MethodDescriptor that has an unknown varint
+// field (fieldNum) set to value. This lets us test hasMethodOption without
+// needing a real protobuf extension registration.
+func methodWithVarintOption(fieldNum uint32, value uint64) protoreflect.MethodDescriptor {
+	var buf []byte
+	buf = protowire.AppendTag(buf, protowire.Number(fieldNum), protowire.VarintType)
+	buf = protowire.AppendVarint(buf, value)
+
+	opts := &descriptorpb.MethodOptions{}
+	opts.ProtoReflect().SetUnknown(protoreflect.RawFields(buf))
+
+	fd := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("test_option.proto"),
+		Package: proto.String("test"),
+		Syntax:  proto.String("proto3"),
+		Dependency: []string{"google/protobuf/empty.proto"},
+		Service: []*descriptorpb.ServiceDescriptorProto{
+			{
+				Name: proto.String("TestOptionService"),
+				Method: []*descriptorpb.MethodDescriptorProto{
+					{
+						Name:       proto.String("TestOptionMethod"),
+						InputType:  proto.String(".google.protobuf.Empty"),
+						OutputType: proto.String(".google.protobuf.Empty"),
+						Options:    opts,
+					},
+				},
+			},
+		},
+	}
+
+	emptyFd := buildEmptyFileDescriptor()
+	fds := &descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{emptyFd, fd},
+	}
+	reg := buildRegistry(fds)
+	fileDesc, err := reg.FindFileByPath("test_option.proto")
+	if err != nil {
+		panic("methodWithVarintOption: failed to find file: " + err.Error())
+	}
+	return fileDesc.Services().Get(0).Methods().Get(0)
 }
 
 func TestToolNameGeneration(t *testing.T) {
@@ -157,25 +202,25 @@ func TestVeryShortNames(t *testing.T) {
 
 func TestHasMethodOption(t *testing.T) {
 	tests := []struct {
-		name     string
-		opts     *descriptorpb.MethodOptions
-		fieldNum uint32
-		expected uint64
-		want     bool
+		name           string
+		opts           *descriptorpb.MethodOptions
+		fieldNum       uint32
+		expectedValues []uint64
+		want           bool
 	}{
 		{
-			name:     "nil options returns false",
-			opts:     nil,
-			fieldNum: 50003,
-			expected: 1,
-			want:     false,
+			name:           "nil options returns false",
+			opts:           nil,
+			fieldNum:       50003,
+			expectedValues: []uint64{1},
+			want:           false,
 		},
 		{
-			name:     "empty options returns false",
-			opts:     &descriptorpb.MethodOptions{},
-			fieldNum: 50003,
-			expected: 1,
-			want:     false,
+			name:           "empty options returns false",
+			opts:           &descriptorpb.MethodOptions{},
+			fieldNum:       50003,
+			expectedValues: []uint64{1},
+			want:           false,
 		},
 	}
 
@@ -213,7 +258,38 @@ func TestHasMethodOption(t *testing.T) {
 			}
 
 			method := fileDesc.Services().Get(0).Methods().Get(0)
-			got := hasMethodOption(method, tt.fieldNum, tt.expected)
+			got := hasMethodOption(method, tt.fieldNum, tt.expectedValues)
+			if got != tt.want {
+				t.Errorf("hasMethodOption() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasMethodOptionMultiValue(t *testing.T) {
+	// Method has option field 50003 set to value 2.
+	method := methodWithVarintOption(50003, 2)
+
+	tests := []struct {
+		name           string
+		expectedValues []uint64
+		want           bool
+	}{
+		{
+			name:           "value 2 matches slice containing 1 and 2",
+			expectedValues: []uint64{1, 2},
+			want:           true,
+		},
+		{
+			name:           "value 2 does not match slice containing only 1",
+			expectedValues: []uint64{1},
+			want:           false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasMethodOption(method, 50003, tt.expectedValues)
 			if got != tt.want {
 				t.Errorf("hasMethodOption() = %v, want %v", got, tt.want)
 			}
