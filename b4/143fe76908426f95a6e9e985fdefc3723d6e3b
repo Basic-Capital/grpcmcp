@@ -1,0 +1,21 @@
+main_test.go
+  s_37fb7440f9a930::t_59ec1c8b84cd94 250
+  s_37fb7440f9a930::t_c02e3faf35b572 247-249
+  s_37fb7440f9a930::t_bdd033f7c86e10 251-253
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.8",
+  "base_commit_sha": "b4143fe76908426f95a6e9e985fdefc3723d6e3b",
+  "prompts": {},
+  "sessions": {
+    "s_37fb7440f9a930": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "060de202-62fd-4276-9b9d-b09dbc0ccea6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Daniel Bak <daniel.bak@basiccapital.com>"
+    }
+  }
+}
