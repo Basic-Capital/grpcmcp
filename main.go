@@ -32,6 +32,21 @@ import (
 var protojsonMarshaller = protojson.MarshalOptions{UseProtoNames: true}
 var protojsonUnmarshaller = protojson.UnmarshalOptions{DiscardUnknown: true}
 
+// operatorIdentityHeader carries the operator's identity, minted by a trusted
+// edge proxy that verified the operator's client cert. It is copied from each
+// inbound SSE message request into the outbound gRPC call so the backend can
+// attribute the call to the human operator behind the agent.
+const operatorIdentityHeader = "X-Operator-Identity"
+
+type operatorIdentityKey struct{}
+
+func operatorIdentityFromRequest(ctx context.Context, r *http.Request) context.Context {
+	if v := r.Header.Get(operatorIdentityHeader); v != "" {
+		return context.WithValue(ctx, operatorIdentityKey{}, v)
+	}
+	return ctx
+}
+
 func toolHandler(c *connect.Client[dynamicpb.Message, dynamicpb.Message], desc protoreflect.MessageDescriptor, headers http.Header) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		msg := dynamicpb.NewMessage(desc)
@@ -55,6 +70,9 @@ func toolHandler(c *connect.Client[dynamicpb.Message, dynamicpb.Message], desc p
 					}
 				}
 			}
+		}
+		if operator, ok := ctx.Value(operatorIdentityKey{}).(string); ok {
+			req.Header().Set(operatorIdentityHeader, operator)
 		}
 		resp, err := c.CallUnary(ctx, req)
 		if err != nil {
@@ -202,6 +220,7 @@ func main() {
 	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value or fieldNumber:value1,value2, e.g. 50003:1 or 50003:1,2)")
 	shortNames := flag.Bool("short-names", false, "Use short tool names (ServiceName__MethodName instead of full package path). Saves tokens when used with LLM agents that list all tool names in context.")
 	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
+	forwardOperatorIdentity := flag.Bool("forward-operator-identity", false, "SSE mode only: copy the X-Operator-Identity header from inbound requests onto outbound gRPC calls. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.")
 
 	flag.Parse()
 
@@ -400,7 +419,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		}
 	} else {
-		sseSrv := server.NewSSEServer(srv)
+		var sseOpts []server.SSEOption
+		if *forwardOperatorIdentity {
+			sseOpts = append(sseOpts, server.WithSSEContextFunc(operatorIdentityFromRequest))
+		}
+		sseSrv := server.NewSSEServer(srv, sseOpts...)
 		if err := sseSrv.Start(*sseHostPort); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		}

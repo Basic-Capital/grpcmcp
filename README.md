@@ -44,6 +44,8 @@ A simple MCP server that will proxy to a grpc backend based on a provided descri
 
 * `require-method-option` string - Only expose methods where a specific proto method option matches a given value. Format: `fieldNumber:value` (e.g. `50003:1`). This filters gRPC methods by checking the raw proto extension field on the method descriptor, so no generated code for the option is needed.
 
+* `forward-operator-identity` - SSE mode only. Copy the `X-Operator-Identity` header from inbound requests onto outbound gRPC calls, so the backend can attribute agent calls to the human operator. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.
+
 ## Help
 
 Join our Discord at https://discord.gg/hDjx3DehwG
