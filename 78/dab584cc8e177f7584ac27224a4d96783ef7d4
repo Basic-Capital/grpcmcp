@@ -1,0 +1,27 @@
+operator_identity_test.go
+  s_37fb7440f9a930::t_d8951499e11cd5 1-65
+main.go
+  s_37fb7440f9a930::t_910090b9b2854d 422-426
+  s_37fb7440f9a930::t_1fdf1bcf0e6319 74-75
+  s_37fb7440f9a930::t_ac868991fd8328 35-49
+  s_37fb7440f9a930::t_22fc8a02b0201e 76
+  s_37fb7440f9a930::t_53d49379053515 223
+README.md
+  s_37fb7440f9a930::t_80c4e938e194d2 47-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.8",
+  "base_commit_sha": "78dab584cc8e177f7584ac27224a4d96783ef7d4",
+  "prompts": {},
+  "sessions": {
+    "s_37fb7440f9a930": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "060de202-62fd-4276-9b9d-b09dbc0ccea6",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
