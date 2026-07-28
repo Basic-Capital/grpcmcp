@@ -4,13 +4,15 @@ A simple MCP server that will proxy to a grpc backend based on a provided descri
 
 ## Quick Start
 
-1. Install the binary: `go install .` or `go install github.com/adiom-data/grpcmcp` Ensure the go bin directory is in your PATH.
+1. Install the binary: `go install .` or `go install github.com/Basic-Capital/grpcmcp` Ensure the go bin directory is in your PATH.
 
 2. In a terminal, run the example grpc server `go run example/main.go`. This will start a grpc health service on port 8090 with server reflection enabled. Note that this runs on the default port that grpcmcp will connect to.
 
-3. **SSE Transport** In another terminal, run `grpcmcp --hostport=localhost:3000 --reflect`. Specifying `hostport` will use SSE. The SSE endpoint will be served at `http://localhost:3000/sse`.
+3. **Streamable HTTP Transport** In another terminal, run `grpcmcp --hostport=localhost:3000 --reflect`. Specifying `hostport` will use Streamable HTTP by default. The MCP endpoint will be served at `http://localhost:3000/mcp`.
 
-3. **STDIN Transport** Set up the MCP config. e.g.
+4. **Legacy SSE Transport** For older clients, run `grpcmcp --hostport=localhost:3000 --transport=sse --reflect`. The SSE endpoint will be served at `http://localhost:3000/sse`.
+
+5. **STDIN Transport** Set up the MCP config. e.g.
 ```
 "grpcmcp": {
     "command": "grpcmcp",
@@ -22,7 +24,9 @@ A simple MCP server that will proxy to a grpc backend based on a provided descri
 
 `grpcmcp --help` for a full list of options.
 
-* `hostport` string - When set, use SSE, and this serves as the server host:port.
+* `hostport` string - When set, serve MCP over HTTP, and use this as the server host:port.
+
+* `transport` string - Transport to use when `hostport` is set. Defaults to `http` for Streamable HTTP at `/mcp`. Set to `sse` for the legacy SSE transport at `/sse`.
 
 * `descriptors` string - Specify file location of the protobuf definitions generated from `buf build -o protos.pb` or `protoc --descriptor_set_out=protos.pb` instead of using gRPC reflection.
 
@@ -45,6 +49,66 @@ A simple MCP server that will proxy to a grpc backend based on a provided descri
 * `require-method-option` string - Only expose methods where a specific proto method option matches a given value. Format: `fieldNumber:value` (e.g. `50003:1`). This filters gRPC methods by checking the raw proto extension field on the method descriptor, so no generated code for the option is needed.
 
 * `forward-operator-identity` - SSE mode only. Copy the `X-Operator-Identity` header from inbound requests onto outbound gRPC calls, so the backend can attribute agent calls to the human operator. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.
+
+* `string64` - If set, expose 64-bit protobuf integer fields (`int64`, `uint64`, `sint64`, `fixed64`, `sfixed64`) as strings only in MCP JSON schemas. This avoids precision ambiguity for JavaScript-based clients and agents. By default, schemas continue to allow either JSON numbers or strings for compatibility.
+
+grpcmcp currently exposes unary gRPC methods as MCP tools. Backend gRPC client-streaming, server-streaming, and bidi-streaming methods are skipped. This is separate from MCP transports: Streamable HTTP and legacy SSE are supported for client connections to grpcmcp.
+
+## Library Usage
+
+grpcmcp can also be embedded as a Go library. The library accepts a descriptor set directly, so applications can decide how to load descriptors and how to wrap the MCP HTTP handler.
+
+```go
+descriptors, err := grpcmcp.LoadDescriptorsFromReflection(ctx, backendURL, headers, false)
+if err != nil {
+    return err
+}
+
+srv, err := grpcmcp.NewServer(grpcmcp.Config{
+    ServerName:  "gRPC MCP Server",
+    Version:     "1.0.0",
+    BaseURL:     backendURL,
+    Descriptors: descriptors,
+    Headers:     grpcmcp.StaticHeaders(headers),
+})
+if err != nil {
+    return err
+}
+
+handler := server.NewStreamableHTTPServer(srv)
+```
+
+To route backend calls through a custom transport, provide `HTTPClient`. For example, an embedded application can use an in-memory HTTP transport such as `go.akshayshah.org/memhttp` by passing the in-memory server's URL and client:
+
+```go
+backend, err := memhttp.New(backendHandler)
+if err != nil {
+    return err
+}
+defer backend.Close()
+
+srv, err := grpcmcp.NewServer(grpcmcp.Config{
+    BaseURL:     backend.URL(),
+    HTTPClient:  backend.Client(),
+    Descriptors: descriptors,
+})
+```
+
+For dynamic backend auth, provide a `ToolHeaderProvider`. The full `mcp.CallToolRequest` is available, including inbound HTTP headers supplied by supported MCP transports.
+
+```go
+srv, err := grpcmcp.NewServer(grpcmcp.Config{
+    BaseURL:     backendURL,
+    Descriptors: descriptors,
+    Headers: func(ctx context.Context, req mcp.CallToolRequest) (http.Header, error) {
+        h := make(http.Header)
+        h.Set("Authorization", req.Header.Get("Authorization"))
+        return h, nil
+    },
+})
+```
+
+Inbound MCP authentication should be handled by wrapping the HTTP handler with standard Go middleware. Outbound backend authentication is controlled by the configured header provider.
 
 ## Help
 
