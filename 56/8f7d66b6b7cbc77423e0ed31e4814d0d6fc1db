@@ -1,0 +1,19 @@
+Dockerfile
+  s_36bf1f04118392::t_9572b7106dec1c 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "568f7d66b6b7cbc77423e0ed31e4814d0d6fc1db",
+  "prompts": {},
+  "sessions": {
+    "s_36bf1f04118392": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "faf532c4-8c1d-45ff-a31a-2fed609de34d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Daniel Bak <daniel.bak@basiccapital.com>"
+    }
+  }
+}
