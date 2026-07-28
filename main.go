@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Basic-Capital/grpcmcp/grpcmcp"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -66,6 +67,49 @@ func generateToolName(shortNames bool, veryShortNames bool, hasShortCollision bo
 		return fmt.Sprintf("%v__%v", simpleServiceName, methodName)
 	}
 	return strings.ReplaceAll(fmt.Sprintf("%v__%v", fullServiceName, methodName), ".", "_")
+}
+
+// buildToolNamer pre-scans for collisions so --short-names / --very-short-names
+// can fall back: services sharing a simple name keep the full path, and method
+// names defined by multiple services keep the service prefix. Streaming and
+// filtered-out methods are skipped to match the actual set of registered tools.
+// Returns nil (default naming) when neither flag is set.
+func buildToolNamer(fds *descriptorpb.FileDescriptorSet, servicesMap map[string]struct{}, methodFilter func(protoreflect.MethodDescriptor) bool, shortNames bool, veryShortNames bool) func(protoreflect.ServiceDescriptor, protoreflect.MethodDescriptor) string {
+	if !shortNames && !veryShortNames {
+		return nil
+	}
+	simpleNameCount := map[string]int{}
+	methodNameCount := map[string]int{}
+	scanReg := buildRegistry(fds)
+	scanReg.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+		for i := range fd.Services().Len() {
+			s := fd.Services().Get(i)
+			if len(servicesMap) > 0 {
+				if _, found := servicesMap[string(s.FullName())]; !found {
+					continue
+				}
+			}
+			simpleNameCount[string(s.Name())]++
+			if veryShortNames {
+				for j := range s.Methods().Len() {
+					m := s.Methods().Get(j)
+					if m.IsStreamingClient() || m.IsStreamingServer() {
+						continue
+					}
+					if methodFilter != nil && !methodFilter(m) {
+						continue
+					}
+					methodNameCount[string(m.Name())]++
+				}
+			}
+		}
+		return true
+	})
+	return func(s protoreflect.ServiceDescriptor, m protoreflect.MethodDescriptor) string {
+		hasShortCollision := simpleNameCount[string(s.Name())] > 1
+		hasVeryShortCollision := methodNameCount[string(m.Name())] > 1
+		return generateToolName(shortNames, veryShortNames, hasShortCollision, hasVeryShortCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
+	}
 }
 
 func buildRegistry(fds *descriptorpb.FileDescriptorSet) *protoregistry.Files {
@@ -206,71 +250,61 @@ func main() {
 		}
 	}
 
-	// Pre-scan for collisions so --short-names / --very-short-names can fall back.
-	// simpleNameCount: how many services share the same simple name (for --short-names)
-	// methodNameCount: how many services define the same method name (for --very-short-names)
-	simpleNameCount := map[string]int{}
-	methodNameCount := map[string]int{}
-	var toolName func(protoreflect.ServiceDescriptor, protoreflect.MethodDescriptor) string
-	if *shortNames || *veryShortNames {
-		scanReg := buildRegistry(descriptorSet)
-		scanReg.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
-			for i := range fd.Services().Len() {
-				s := fd.Services().Get(i)
-				if len(servicesMap) > 0 {
-					if _, found := servicesMap[string(s.FullName())]; !found {
-						continue
-					}
-				}
-				simpleNameCount[string(s.Name())]++
-				if *veryShortNames {
-					// Count how many services define each method name.
-					// If two services both have "GetPlan", that method can't use
-					// the method-only format (e.g. "GetPlan") and must fall back
-					// to include the service prefix (e.g. "WalletService__GetPlan").
-					// We skip streaming and filtered-out methods to match the actual
-					// set of tools that will be registered.
-					for j := range s.Methods().Len() {
-						m := s.Methods().Get(j)
-						if m.IsStreamingClient() || m.IsStreamingServer() {
-							continue
-						}
-						if methodFilter != nil && !methodFilter(m) {
-							continue
-						}
-						methodNameCount[string(m.Name())]++
-					}
-				}
-			}
-			return true
-		})
-		toolName = func(s protoreflect.ServiceDescriptor, m protoreflect.MethodDescriptor) string {
-			hasShortCollision := simpleNameCount[string(s.Name())] > 1
-			hasVeryShortCollision := methodNameCount[string(m.Name())] > 1
-			return generateToolName(*shortNames, *veryShortNames, hasShortCollision, hasVeryShortCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
-		}
-	}
+	toolName := buildToolNamer(descriptorSet, servicesMap, methodFilter, *shortNames, *veryShortNames)
 
 	headersProvider := grpcmcp.StaticHeaders(http.Header(headers))
 	if *forwardOperatorIdentity {
 		headersProvider = operatorIdentityHeaders(headersProvider)
 	}
 
-	srv, err := grpcmcp.NewServer(grpcmcp.Config{
-		Headers:      headersProvider,
-		ServerName:   *serverName,
-		Version:      *serverVersion,
-		Descriptors:  descriptorSet,
-		Services:     serviceNames,
-		BaseURL:      *baseURL,
-		UseConnect:   *useConnect,
-		String64:     *string64,
-		MethodFilter: methodFilter,
-		ToolName:     toolName,
-	})
+	cfg := grpcmcp.Config{
+		Headers:       headersProvider,
+		ServerName:    *serverName,
+		Version:       *serverVersion,
+		Descriptors:   descriptorSet,
+		Services:      serviceNames,
+		BaseURL:       *baseURL,
+		UseConnect:    *useConnect,
+		String64:      *string64,
+		MethodFilter:  methodFilter,
+		ToolName:      toolName,
+		ServerOptions: []server.ServerOption{server.WithToolCapabilities(*reflect)},
+	}
+	srv, err := grpcmcp.NewServer(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(-1)
+	}
+
+	if *reflect {
+		// Periodically re-run reflection so tools track the backend's schema:
+		// new RPCs deployed on the backend appear without restarting grpcmcp.
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+				newDescriptors, err := grpcmcp.LoadDescriptorsFromReflection(ctx, *baseURL, http.Header(headers), *useConnect)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "refresh: %v\n", err)
+					continue
+				}
+				refreshCfg := cfg
+				refreshCfg.Descriptors = newDescriptors
+				refreshCfg.ToolName = buildToolNamer(newDescriptors, servicesMap, methodFilter, *shortNames, *veryShortNames)
+				tools, err := grpcmcp.Tools(refreshCfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "refresh: %v\n", err)
+					continue
+				}
+				srv.SetTools(tools...)
+				fmt.Fprintf(os.Stderr, "refresh: %d tools registered\n", len(tools))
+			}
+		}()
 	}
 
 	if *sseHostPort == "" {
