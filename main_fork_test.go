@@ -94,68 +94,6 @@ func methodWithVarintOption(fieldNum uint32, value uint64) protoreflect.MethodDe
 
 func TestToolNameGeneration(t *testing.T) {
 	tests := []struct {
-		name       string
-		shortNames bool
-		pkg        string
-		service    string
-		method     string
-		wantName   string
-	}{
-		{
-			name:       "full name by default",
-			shortNames: false,
-			pkg:        "com.example.systems.wallet",
-			service:    "WalletService",
-			method:     "GetPlan",
-			wantName:   "com_example_systems_wallet_WalletService__GetPlan",
-		},
-		{
-			name:       "short name strips package prefix",
-			shortNames: true,
-			pkg:        "com.example.systems.wallet",
-			service:    "WalletService",
-			method:     "GetPlan",
-			wantName:   "WalletService__GetPlan",
-		},
-		{
-			name:       "full name has dots replaced with underscores",
-			shortNames: false,
-			pkg:        "com.example.deeply.nested.pkg",
-			service:    "MyService",
-			method:     "DoThing",
-			wantName:   "com_example_deeply_nested_pkg_MyService__DoThing",
-		},
-		{
-			name:       "short name has no dots to replace",
-			shortNames: true,
-			pkg:        "com.example.deeply.nested.pkg",
-			service:    "MyService",
-			method:     "DoThing",
-			wantName:   "MyService__DoThing",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := generateToolName(tt.shortNames, false, false, false, tt.pkg+"."+tt.service, tt.service, string(tt.method))
-			if got != tt.wantName {
-				t.Errorf("generateToolName() = %q, want %q", got, tt.wantName)
-			}
-		})
-	}
-}
-
-func TestToolNameCollisionFallback(t *testing.T) {
-	// When short-name collision is detected, even with shortNames=true, should use full name
-	got := generateToolName(true, false, true, false, "com.example.pkg1.FooService", "FooService", "GetBar")
-	want := "com_example_pkg1_FooService__GetBar"
-	if got != want {
-		t.Errorf("generateToolName() with collision = %q, want %q", got, want)
-	}
-}
-
-func TestVeryShortNames(t *testing.T) {
-	tests := []struct {
 		name                  string
 		hasShortCollision     bool
 		hasVeryShortCollision bool
@@ -188,11 +126,20 @@ func TestVeryShortNames(t *testing.T) {
 			methodName:            "GetPlan",
 			wantName:              "com_example_wallet_WalletService__GetPlan",
 		},
+		{
+			name:                  "full name replaces every dot with an underscore",
+			hasShortCollision:     true,
+			hasVeryShortCollision: true,
+			fullServiceName:       "com.example.deeply.nested.pkg.MyService",
+			simpleServiceName:     "MyService",
+			methodName:            "DoThing",
+			wantName:              "com_example_deeply_nested_pkg_MyService__DoThing",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := generateToolName(false, true, tt.hasShortCollision, tt.hasVeryShortCollision, tt.fullServiceName, tt.simpleServiceName, tt.methodName)
+			got := generateToolName(tt.hasShortCollision, tt.hasVeryShortCollision, tt.fullServiceName, tt.simpleServiceName, tt.methodName)
 			if got != tt.wantName {
 				t.Errorf("generateToolName() = %q, want %q", got, tt.wantName)
 			}

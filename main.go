@@ -60,25 +60,25 @@ func (s *headerFlags) Set(value string) error {
 	return nil
 }
 
-func generateToolName(shortNames bool, veryShortNames bool, hasShortCollision bool, hasVeryShortCollision bool, fullServiceName string, simpleServiceName string, methodName string) string {
-	if veryShortNames && !hasVeryShortCollision {
+// generateToolName returns the shortest name that stays unique. A method name
+// that no other exposed service defines is used on its own. A collision adds the
+// simple service name, and a collision on that adds the full package path.
+//
+// Short names matter because an agent holds every tool name in context.
+func generateToolName(hasShortCollision bool, hasVeryShortCollision bool, fullServiceName string, simpleServiceName string, methodName string) string {
+	if !hasVeryShortCollision {
 		return methodName
 	}
-	if (shortNames || veryShortNames) && !hasShortCollision {
+	if !hasShortCollision {
 		return fmt.Sprintf("%v__%v", simpleServiceName, methodName)
 	}
 	return strings.ReplaceAll(fmt.Sprintf("%v__%v", fullServiceName, methodName), ".", "_")
 }
 
-// buildToolNamer pre-scans for collisions so --short-names / --very-short-names
-// can fall back: services sharing a simple name keep the full path, and method
-// names defined by multiple services keep the service prefix. Streaming and
-// filtered-out methods are skipped to match the actual set of registered tools.
-// Returns nil (default naming) when neither flag is set.
-func buildToolNamer(fds *descriptorpb.FileDescriptorSet, servicesMap map[string]struct{}, methodFilter func(protoreflect.MethodDescriptor) bool, shortNames bool, veryShortNames bool) func(protoreflect.ServiceDescriptor, protoreflect.MethodDescriptor) string {
-	if !shortNames && !veryShortNames {
-		return nil
-	}
+// buildToolNamer pre-scans for the collisions that generateToolName falls back
+// on. Streaming and filtered-out methods are skipped to match the actual set of
+// registered tools.
+func buildToolNamer(fds *descriptorpb.FileDescriptorSet, servicesMap map[string]struct{}, methodFilter func(protoreflect.MethodDescriptor) bool) func(protoreflect.ServiceDescriptor, protoreflect.MethodDescriptor) string {
 	simpleNameCount := map[string]int{}
 	methodNameCount := map[string]int{}
 	scanReg := buildRegistry(fds)
@@ -91,17 +91,15 @@ func buildToolNamer(fds *descriptorpb.FileDescriptorSet, servicesMap map[string]
 				}
 			}
 			simpleNameCount[string(s.Name())]++
-			if veryShortNames {
-				for j := range s.Methods().Len() {
-					m := s.Methods().Get(j)
-					if m.IsStreamingClient() || m.IsStreamingServer() {
-						continue
-					}
-					if methodFilter != nil && !methodFilter(m) {
-						continue
-					}
-					methodNameCount[string(m.Name())]++
+			for j := range s.Methods().Len() {
+				m := s.Methods().Get(j)
+				if m.IsStreamingClient() || m.IsStreamingServer() {
+					continue
 				}
+				if methodFilter != nil && !methodFilter(m) {
+					continue
+				}
+				methodNameCount[string(m.Name())]++
 			}
 		}
 		return true
@@ -109,7 +107,7 @@ func buildToolNamer(fds *descriptorpb.FileDescriptorSet, servicesMap map[string]
 	return func(s protoreflect.ServiceDescriptor, m protoreflect.MethodDescriptor) string {
 		hasShortCollision := simpleNameCount[string(s.Name())] > 1
 		hasVeryShortCollision := methodNameCount[string(m.Name())] > 1
-		return generateToolName(shortNames, veryShortNames, hasShortCollision, hasVeryShortCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
+		return generateToolName(hasShortCollision, hasVeryShortCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
 	}
 }
 
@@ -176,18 +174,15 @@ func main() {
 	flag.Var(&headers, "header", "Headers to add to the backend request (Header: Value). Can apply multiple times.")
 	serverName := flag.String("name", "gRPC MCP Server", "Name of MCP Server")
 	serverVersion := flag.String("version", "1.0.0", "Version of MCP Server")
-	sseHostPort := flag.String("hostport", "", "host:port for HTTP server, STDIN if not set")
-	transport := flag.String("transport", "http", "Transport to use when hostport is set: http or sse")
+	instructions := flag.String("instructions", "", "Natural-language guidance for the agent on what this server is for")
+	hostPort := flag.String("hostport", "", "host:port for the Streamable HTTP server. Without it the server uses stdio.")
 	descriptors := flag.String("descriptors", "", "Location of the descriptor")
 	reflect := flag.Bool("reflect", false, "Use reflection to get descriptors")
 	services := flag.String("services", "", "If set, a comma separated list of services to expose")
-	bearer := flag.String("bearer", "", "Token to use in an Authorization bearer header")
 	bearerEnv := flag.String("bearer-env", "", "Environment variable for token to use in an Authorization bearer header")
 	baseURL := flag.String("url", "http://localhost:8090", "The url of the backend")
 	useConnect := flag.Bool("connect", false, "Use connect protocol (instead of gRPC)")
 	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value or fieldNumber:value1,value2, e.g. 50003:1 or 50003:1,2)")
-	shortNames := flag.Bool("short-names", false, "Use short tool names (ServiceName__MethodName instead of full package path). Saves tokens when used with LLM agents that list all tool names in context.")
-	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
 	forwardOperatorIdentity := flag.Bool("forward-operator-identity", false, "Copy the X-Operator-Identity header from inbound MCP requests onto outbound gRPC calls. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.")
 	string64 := flag.Bool("string64", false, "Expose 64-bit protobuf integer fields as strings only in JSON schemas")
 	refreshInterval := flag.Duration("refresh-interval", 5*time.Minute, "How often to re-run reflection so new backend methods appear. Applies when reflect is set without descriptors.")
@@ -216,7 +211,7 @@ func main() {
 	// Only the HTTP server serves TLS. Without hostport the process serves stdio,
 	// where these flags do nothing, so report the mismatch in place of dropping a
 	// security setting without a word.
-	if *tlsCrt != "" && *sseHostPort == "" {
+	if *tlsCrt != "" && *hostPort == "" {
 		fmt.Fprint(os.Stderr, "-tls-crt, -tls-key, and -ca-file need -hostport. Without it the server uses stdio, which has no TLS.\n")
 		os.Exit(-1)
 	}
@@ -255,12 +250,15 @@ func main() {
 		optFieldNum = uint32(fn)
 	}
 
+	// The token is read from the environment, never from a flag: an argv value is
+	// visible to every process on the host through ps.
 	if *bearerEnv != "" {
-		*bearer, _ = os.LookupEnv(*bearerEnv)
-	}
-
-	if *bearer != "" {
-		http.Header(headers).Set("Authorization", "Bearer "+*bearer)
+		if bearer, ok := os.LookupEnv(*bearerEnv); ok && bearer != "" {
+			http.Header(headers).Set("Authorization", "Bearer "+bearer)
+		} else {
+			fmt.Fprintf(os.Stderr, "-bearer-env names %q, which is empty or unset.\n", *bearerEnv)
+			os.Exit(-1)
+		}
 	}
 
 	ctx := context.Background()
@@ -297,11 +295,21 @@ func main() {
 		}
 	}
 
-	toolName := buildToolNamer(descriptorSet, servicesMap, methodFilter, *shortNames, *veryShortNames)
+	toolName := buildToolNamer(descriptorSet, servicesMap, methodFilter)
 
 	headersProvider := grpcmcp.StaticHeaders(http.Header(headers))
 	if *forwardOperatorIdentity {
 		headersProvider = operatorIdentityHeaders(headersProvider)
+	}
+
+	// listChanged promises the client a notification when the tool set changes.
+	// Only stdio can keep that promise. The HTTP server is stateless and serves
+	// no GET stream, so it holds no client to notify, and declaring the
+	// capability there would advertise something this server cannot deliver.
+	serveHTTP := *hostPort != ""
+	serverOptions := []server.ServerOption{server.WithToolCapabilities(!serveHTTP)}
+	if *instructions != "" {
+		serverOptions = append(serverOptions, server.WithInstructions(*instructions))
 	}
 
 	cfg := grpcmcp.Config{
@@ -316,7 +324,7 @@ func main() {
 		String64:      *string64,
 		MethodFilter:  methodFilter,
 		ToolName:      toolName,
-		ServerOptions: []server.ServerOption{server.WithToolCapabilities(true)},
+		ServerOptions: serverOptions,
 	}
 	srv, err := grpcmcp.NewServer(cfg)
 	if err != nil {
@@ -347,8 +355,6 @@ func main() {
 					backendClient:   backendClient,
 					servicesMap:     servicesMap,
 					methodFilter:    methodFilter,
-					shortNames:      *shortNames,
-					veryShortNames:  *veryShortNames,
 					timeout:         *refreshTimeout,
 					previousToolLen: toolCount,
 				})
@@ -362,38 +368,37 @@ func main() {
 		}()
 	}
 
-	if *sseHostPort == "" {
+	if !serveHTTP {
 		if err := server.ServeStdio(srv); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		}
+		return
+	}
+
+	// Stateless, with no GET stream. Every tool call is an independent unary gRPC
+	// request, so this server keeps nothing between requests: any replica can
+	// serve any request, and a restart costs a client nothing.
+	//
+	// A session is optional in MCP 2025-03-26 through 2025-11-25, and MCP
+	// 2026-07-28 removes it. Declining it is correct under every revision this
+	// server accepts, and 2026-07-28 asks for exactly this shape: ignore an
+	// inbound Mcp-Session-Id, and answer GET with 405.
+	httpSrv := server.NewStreamableHTTPServer(srv,
+		server.WithStateLess(true),
+		server.WithDisableStreaming(true),
+	)
+	// Mount at the endpoint path rather than at every path, matching the routing
+	// that StreamableHTTPServer.Start sets up.
+	mux := http.NewServeMux()
+	mux.Handle(streamableEndpointPath, rejectBrowserOrigin(rejectUnsupportedProtocolVersion(httpSrv)))
+
+	if *tlsCrt != "" {
+		err = serveTLS(mux, *hostPort, *caFile, *tlsCrt, *tlsKey)
 	} else {
-		var err error
-		serveTLSRequested := *tlsCrt != ""
-		switch *transport {
-		case "http", "streamable-http":
-			httpSrv := server.NewStreamableHTTPServer(srv)
-			if serveTLSRequested {
-				// Match the routing that StreamableHTTPServer.Start sets up:
-				// the server is mounted at its endpoint path, not at every path.
-				mux := http.NewServeMux()
-				mux.Handle(streamableEndpointPath, httpSrv)
-				err = serveTLS(mux, *sseHostPort, *caFile, *tlsCrt, *tlsKey)
-			} else {
-				err = httpSrv.Start(*sseHostPort)
-			}
-		case "sse":
-			sseSrv := server.NewSSEServer(srv)
-			if serveTLSRequested {
-				err = serveTLS(sseSrv, *sseHostPort, *caFile, *tlsCrt, *tlsKey)
-			} else {
-				err = sseSrv.Start(*sseHostPort)
-			}
-		default:
-			err = fmt.Errorf("unknown transport %q: expected http, streamable-http, or sse", *transport)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
-		}
+		err = (&http.Server{Addr: *hostPort, Handler: mux}).ListenAndServe()
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 	}
 }
 

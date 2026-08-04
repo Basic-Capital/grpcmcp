@@ -8,7 +8,7 @@ require (
 	connectrpc.com/connect v1.18.1
 	connectrpc.com/grpchealth v1.3.0
 	connectrpc.com/grpcreflect v1.3.0
-	github.com/mark3labs/mcp-go v0.54.1
+	github.com/mark3labs/mcp-go v0.57.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	golang.org/x/net v0.39.0
 	google.golang.org/protobuf v1.36.11

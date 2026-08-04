@@ -164,32 +164,6 @@ func TestStreamableHTTPToolInputSchemasCompileAndValidate(t *testing.T) {
 	})
 }
 
-func TestLegacySSETransportListsAndCallsReflectedTools(t *testing.T) {
-	backendURL := startReflectingHealthBackend(t)
-	srv := buildReflectedTestServer(t, backendURL)
-	sseSrv := mcpserver.NewTestServer(srv)
-	t.Cleanup(sseSrv.Close)
-
-	client, err := mcpclient.NewSSEMCPClient(sseSrv.URL + "/sse")
-	if err != nil {
-		t.Fatalf("NewSSEMCPClient failed: %v", err)
-	}
-	startAndInitializeClient(t, client)
-
-	tools, err := client.ListTools(t.Context(), mcp.ListToolsRequest{})
-	if err != nil {
-		t.Fatalf("ListTools failed: %v", err)
-	}
-	if !hasTool(tools.Tools, healthCheckTool) {
-		t.Fatalf("expected SSE tools list to include %q, got %+v", healthCheckTool, tools.Tools)
-	}
-	if hasTool(tools.Tools, healthWatchTool) {
-		t.Fatalf("streaming tool %q should not be listed over SSE", healthWatchTool)
-	}
-
-	assertHealthCheckToolCall(t, client)
-}
-
 func TestDynamicHeaderProviderReceivesInboundToolRequestHeaders(t *testing.T) {
 	const token = "Bearer caller-token"
 

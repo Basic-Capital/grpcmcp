@@ -14,15 +14,13 @@ import (
 
 // refreshParams carries the settings that one refresh attempt needs.
 type refreshParams struct {
-	baseURL        string
-	headers        http.Header
-	useConnect     bool
-	backendClient  connect.HTTPClient
-	servicesMap    map[string]struct{}
-	methodFilter   func(protoreflect.MethodDescriptor) bool
-	shortNames     bool
-	veryShortNames bool
-	timeout        time.Duration
+	baseURL       string
+	headers       http.Header
+	useConnect    bool
+	backendClient connect.HTTPClient
+	servicesMap   map[string]struct{}
+	methodFilter  func(protoreflect.MethodDescriptor) bool
+	timeout       time.Duration
 	// previousToolLen is how many tools the server holds now. A refresh that
 	// would drop a non-empty set to zero is skipped.
 	previousToolLen int
@@ -54,7 +52,7 @@ func refreshTools(ctx context.Context, srv *server.MCPServer, cfg grpcmcp.Config
 
 	refreshCfg := cfg
 	refreshCfg.Descriptors = newDescriptors
-	refreshCfg.ToolName = buildToolNamer(newDescriptors, p.servicesMap, p.methodFilter, p.shortNames, p.veryShortNames)
+	refreshCfg.ToolName = buildToolNamer(newDescriptors, p.servicesMap, p.methodFilter)
 	tools, err := grpcmcp.Tools(refreshCfg)
 	if err != nil {
 		return 0, err
