@@ -90,7 +90,7 @@ func buildToolNamer(fds *descriptorpb.FileDescriptorSet, servicesMap map[string]
 					continue
 				}
 			}
-			simpleNameCount[string(s.Name())]++
+			exposed := false
 			for j := range s.Methods().Len() {
 				m := s.Methods().Get(j)
 				if m.IsStreamingClient() || m.IsStreamingServer() {
@@ -99,7 +99,14 @@ func buildToolNamer(fds *descriptorpb.FileDescriptorSet, servicesMap map[string]
 				if methodFilter != nil && !methodFilter(m) {
 					continue
 				}
+				exposed = true
 				methodNameCount[string(m.Name())]++
+			}
+			// Count only services that contribute at least one tool, so a
+			// same-named sibling that exposes nothing does not force the
+			// full-path fallback.
+			if exposed {
+				simpleNameCount[string(s.Name())]++
 			}
 		}
 		return true

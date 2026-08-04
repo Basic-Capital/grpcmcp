@@ -10,17 +10,19 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// writeJSONRPCError answers with an HTTP status and a JSON-RPC error that has no
-// id. The spec allows the missing id here: the request body may not have parsed,
-// so there may be no id to answer with.
+// writeJSONRPCError answers with an HTTP status and a JSON-RPC error whose id is
+// null. JSON-RPC 2.0 requires the id member on every response; null is the value
+// when the request id cannot be determined — for example when the body has not
+// been parsed yet, as here on the Origin and protocol-version checks.
 func writeJSONRPCError(w http.ResponseWriter, status int, code int, message string) {
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
+		"id":      nil,
 		"error":   map[string]any{"code": code, "message": message},
 	})
 	if err != nil {
-		// The value is a fixed shape of strings and ints, so this cannot fail.
-		// Answer with the status alone rather than a half-written body.
+		// The value is a fixed shape of strings, ints, and a nil id, so this
+		// cannot fail. Answer with the status alone rather than a half-written body.
 		w.WriteHeader(status)
 		return
 	}

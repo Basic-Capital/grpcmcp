@@ -58,6 +58,26 @@ func post(t *testing.T, h http.Handler, body string, header http.Header) *http.R
 	return rec.Result()
 }
 
+// assertJSONRPCErrorIDNull checks that an error response includes "id": null,
+// which JSON-RPC 2.0 requires when the request id is unknown.
+func assertJSONRPCErrorIDNull(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var msg struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(b, &msg); err != nil {
+		t.Fatalf("decode %q: %v", string(b), err)
+	}
+	if string(msg.ID) != "null" {
+		t.Errorf("id = %s, want null", msg.ID)
+	}
+	return b
+}
+
 // decodeResult reads the JSON-RPC result object out of an HTTP response.
 func decodeResult(t *testing.T, resp *http.Response) map[string]any {
 	t.Helper()
@@ -160,6 +180,7 @@ func TestOriginRejected(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", resp.StatusCode)
 	}
+	assertJSONRPCErrorIDNull(t, resp)
 }
 
 // TestNoOriginAccepted guards the other side of the Origin check: a normal MCP
@@ -200,10 +221,7 @@ func TestUnsupportedProtocolVersionRejected(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
+	b := assertJSONRPCErrorIDNull(t, resp)
 	// The body names the versions this server does support, so a client can
 	// retry on one of them without guessing.
 	if !strings.Contains(string(b), mcp.LATEST_PROTOCOL_VERSION) {

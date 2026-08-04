@@ -33,6 +33,30 @@ func buildFileDescriptor(pkg string, serviceName string, methods []string) *desc
 	}
 }
 
+// buildServerStreamingFileDescriptor is like buildFileDescriptor but marks the
+// single method as server-streaming, so buildToolNamer must skip it.
+func buildServerStreamingFileDescriptor(pkg, serviceName, methodName string) *descriptorpb.FileDescriptorProto {
+	return &descriptorpb.FileDescriptorProto{
+		Name:       proto.String(pkg + "/" + serviceName + ".proto"),
+		Package:    proto.String(pkg),
+		Syntax:     proto.String("proto3"),
+		Dependency: []string{"google/protobuf/empty.proto"},
+		Service: []*descriptorpb.ServiceDescriptorProto{
+			{
+				Name: proto.String(serviceName),
+				Method: []*descriptorpb.MethodDescriptorProto{
+					{
+						Name:            proto.String(methodName),
+						InputType:       proto.String(".google.protobuf.Empty"),
+						OutputType:      proto.String(".google.protobuf.Empty"),
+						ServerStreaming: proto.Bool(true),
+					},
+				},
+			},
+		},
+	}
+}
+
 func buildEmptyFileDescriptor() *descriptorpb.FileDescriptorProto {
 	// google/protobuf/empty.proto for dependency resolution
 	fd, _ := (&emptypb.Empty{}).ProtoReflect().Descriptor().ParentFile().Options().(*descriptorpb.FileOptions)
@@ -90,6 +114,33 @@ func methodWithVarintOption(fieldNum uint32, value uint64) protoreflect.MethodDe
 		panic("methodWithVarintOption: failed to find file: " + err.Error())
 	}
 	return fileDesc.Services().Get(0).Methods().Get(0)
+}
+
+// TestBuildToolNamerSkipsServicesWithNoExposedMethods guards the short-name
+// collision scan: a same-named sibling that only has streaming (or filtered-out)
+// methods must not force the full-path fallback.
+func TestBuildToolNamerSkipsServicesWithNoExposedMethods(t *testing.T) {
+	fds := &descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{
+			buildEmptyFileDescriptor(),
+			buildFileDescriptor("pkg1", "WalletService", []string{"GetPlan"}),
+			buildFileDescriptor("pkg3", "OtherService", []string{"GetPlan"}),
+			// Same simple name as pkg1, but nothing exposed — must not count.
+			buildServerStreamingFileDescriptor("pkg2", "WalletService", "WatchPlan"),
+		},
+	}
+	namer := buildToolNamer(fds, nil, nil)
+	reg := buildRegistry(fds)
+	fd, err := reg.FindFileByPath("pkg1/WalletService.proto")
+	if err != nil {
+		t.Fatalf("FindFileByPath: %v", err)
+	}
+	s := fd.Services().Get(0)
+	m := s.Methods().Get(0)
+	got := namer(s, m)
+	if got != "WalletService__GetPlan" {
+		t.Errorf("namer() = %q, want %q (streaming sibling must not force full path)", got, "WalletService__GetPlan")
+	}
 }
 
 func TestToolNameGeneration(t *testing.T) {
