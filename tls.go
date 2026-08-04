@@ -70,23 +70,37 @@ func backendTLSClient(caFile string, certFile string, keyFile string) (connect.H
 	return &http.Client{Transport: transport}, nil
 }
 
-// serveTLS serves handler over TLS on addr. caFile, when set, supplies the
-// roots used to verify inbound client certificates, which requires every client
-// to present one.
-func serveTLS(handler http.Handler, addr string, caFile string, certFile string, keyFile string) error {
+// serverTLSConfig builds the TLS config this server listens with. caFile, when
+// set, supplies the roots used to verify inbound client certificates.
+//
+// ClientCAs is the server-side field, and it verifies the client we accept.
+// RootCAs would have no effect here, which is the reverse of the outbound client
+// in backendTLSClient. ClientAuth must also be set: a pool on its own verifies
+// nothing, because the server never asks for a certificate.
+func serverTLSConfig(caFile string) (*tls.Config, error) {
 	var cfg tls.Config
 	if caFile != "" {
 		pool, err := certPoolFromFile(caFile)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		cfg.ClientCAs = pool
 		cfg.ClientAuth = tls.RequireAndVerifyClientCert
 	}
+	return &cfg, nil
+}
+
+// serveTLS serves handler over TLS on addr. caFile, when set, requires every
+// client to present a certificate that the roots in caFile verify.
+func serveTLS(handler http.Handler, addr string, caFile string, certFile string, keyFile string) error {
+	cfg, err := serverTLSConfig(caFile)
+	if err != nil {
+		return err
+	}
 	httpSrv := &http.Server{
 		Addr:      addr,
 		Handler:   handler,
-		TLSConfig: &cfg,
+		TLSConfig: cfg,
 	}
 	// ListenAndServeTLS, not ListenAndServe: the latter ignores TLSConfig and
 	// serves plaintext.

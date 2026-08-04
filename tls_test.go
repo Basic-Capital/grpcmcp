@@ -99,6 +99,91 @@ func TestServeTLSServesTLS(t *testing.T) {
 	}
 }
 
+// TestServerTLSConfigRequiresClientCertificate covers the inbound mTLS wiring.
+// ClientCAs is the server-side field and ClientAuth is what makes the server ask
+// for a certificate, so a mix-up with RootCAs, or a missing ClientAuth, would
+// accept a client that presents nothing.
+func TestServerTLSConfigRequiresClientCertificate(t *testing.T) {
+	certPath, keyPath, caPath := writeSelfSignedCert(t)
+
+	cfg, err := serverTLSConfig(caPath)
+	if err != nil {
+		t.Fatalf("serverTLSConfig: %v", err)
+	}
+	if cfg.ClientCAs == nil {
+		t.Fatal("ClientCAs is not set, so inbound certificates are not verified")
+	}
+	if cfg.ClientAuth != tls.RequireAndVerifyClientCert {
+		t.Fatalf("ClientAuth = %v, want RequireAndVerifyClientCert", cfg.ClientAuth)
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair: %v", err)
+	}
+	cfg.Certificates = []tls.Certificate{serverCert}
+
+	// Port 0 lets the kernel pick, so nothing races for the address.
+	rawListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	listener := tls.NewListener(rawListener, cfg)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})}
+	go func() { _ = srv.Serve(listener) }()
+	t.Cleanup(func() { srv.Close() })
+
+	url := "https://" + rawListener.Addr().String() + "/"
+	pool, err := certPoolFromFile(caPath)
+	if err != nil {
+		t.Fatalf("certPoolFromFile: %v", err)
+	}
+
+	t.Run("a client with no certificate is rejected", func(t *testing.T) {
+		client := &http.Client{Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		}}
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			t.Fatal("the server accepted a client that presented no certificate")
+		}
+	})
+
+	t.Run("a client with a certificate from the CA succeeds", func(t *testing.T) {
+		client := &http.Client{Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      pool,
+				Certificates: []tls.Certificate{serverCert},
+			},
+		}}
+		resp, err := client.Get(url)
+		if err != nil {
+			t.Fatalf("a client with a valid certificate was rejected: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	})
+}
+
+// No caFile means no client certificate is demanded.
+func TestServerTLSConfigWithoutCAFileDoesNotRequireClientCert(t *testing.T) {
+	cfg, err := serverTLSConfig("")
+	if err != nil {
+		t.Fatalf("serverTLSConfig: %v", err)
+	}
+	if cfg.ClientCAs != nil {
+		t.Error("ClientCAs is set without a CA file")
+	}
+	if cfg.ClientAuth != tls.NoClientCert {
+		t.Errorf("ClientAuth = %v, want NoClientCert", cfg.ClientAuth)
+	}
+}
+
 func TestBackendTLSClient(t *testing.T) {
 	certPath, keyPath, caPath := writeSelfSignedCert(t)
 

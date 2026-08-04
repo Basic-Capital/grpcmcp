@@ -213,6 +213,13 @@ func main() {
 		fmt.Fprint(os.Stderr, "-ca-file needs -tls-crt and -tls-key.\n")
 		os.Exit(-1)
 	}
+	// Only the HTTP server serves TLS. Without hostport the process serves stdio,
+	// where these flags do nothing, so report the mismatch in place of dropping a
+	// security setting without a word.
+	if *tlsCrt != "" && *sseHostPort == "" {
+		fmt.Fprint(os.Stderr, "-tls-crt, -tls-key, and -ca-file need -hostport. Without it the server uses stdio, which has no TLS.\n")
+		os.Exit(-1)
+	}
 
 	tlsBackendClient, err := backendTLSClient(*clientCAFile, *clientTLSCrt, *clientTLSKey)
 	if err != nil {
