@@ -57,14 +57,17 @@ func backendTLSClient(caFile string, certFile string, keyFile string) (connect.H
 		}
 		cfg.Certificates = []tls.Certificate{cert}
 	}
-	return &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &cfg,
-			// A custom TLSClientConfig turns off the automatic HTTP/2 upgrade.
-			// gRPC needs HTTP/2, so ask for it explicitly.
-			ForceAttemptHTTP2: true,
-		},
-	}, nil
+	// Start from DefaultTransport and change only the TLS settings. A transport
+	// built from an empty literal drops every default: Proxy, so HTTPS_PROXY and
+	// NO_PROXY stop working; the dial and handshake timeouts; and the idle
+	// connection limits, which leaves an idle connection open for the life of the
+	// process.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &cfg
+	// A custom TLSClientConfig turns off the automatic HTTP/2 upgrade. gRPC needs
+	// HTTP/2, so ask for it explicitly.
+	transport.ForceAttemptHTTP2 = true
+	return &http.Client{Transport: transport}, nil
 }
 
 // serveTLS serves handler over TLS on addr. caFile, when set, supplies the

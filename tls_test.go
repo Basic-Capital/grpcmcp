@@ -112,6 +112,41 @@ func TestBackendTLSClient(t *testing.T) {
 		}
 	})
 
+	// The TLS client replaces http.DefaultClient on the backend path, so it must
+	// keep what DefaultTransport provides. A transport built from an empty literal
+	// silently drops all of it.
+	t.Run("inherits the DefaultTransport settings", func(t *testing.T) {
+		c, err := backendTLSClient(caPath, "", "")
+		if err != nil {
+			t.Fatalf("backendTLSClient: %v", err)
+		}
+		got := c.(*http.Client).Transport.(*http.Transport)
+		want := http.DefaultTransport.(*http.Transport)
+
+		// A nil Proxy means no proxying at all, so HTTPS_PROXY and NO_PROXY stop
+		// working. It is not the same as ProxyFromEnvironment.
+		if got.Proxy == nil {
+			t.Error("Proxy is nil, so HTTP_PROXY, HTTPS_PROXY, and NO_PROXY are ignored")
+		}
+		// An unset IdleConnTimeout means no limit, which keeps an idle connection
+		// and its goroutine for the life of the process.
+		if got.IdleConnTimeout != want.IdleConnTimeout {
+			t.Errorf("IdleConnTimeout = %v, want %v", got.IdleConnTimeout, want.IdleConnTimeout)
+		}
+		if got.TLSHandshakeTimeout != want.TLSHandshakeTimeout {
+			t.Errorf("TLSHandshakeTimeout = %v, want %v", got.TLSHandshakeTimeout, want.TLSHandshakeTimeout)
+		}
+		if got.MaxIdleConns != want.MaxIdleConns {
+			t.Errorf("MaxIdleConns = %v, want %v", got.MaxIdleConns, want.MaxIdleConns)
+		}
+		if got.ExpectContinueTimeout != want.ExpectContinueTimeout {
+			t.Errorf("ExpectContinueTimeout = %v, want %v", got.ExpectContinueTimeout, want.ExpectContinueTimeout)
+		}
+		if got.DialContext == nil {
+			t.Error("DialContext is nil, so the dial has no timeout")
+		}
+	})
+
 	t.Run("CA file sets RootCAs and keeps HTTP/2", func(t *testing.T) {
 		c, err := backendTLSClient(caPath, "", "")
 		if err != nil {
