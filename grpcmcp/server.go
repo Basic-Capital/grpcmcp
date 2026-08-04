@@ -73,13 +73,39 @@ func LoadDescriptorsFromFile(path string) (*descriptorpb.FileDescriptorSet, erro
 	return &fds, nil
 }
 
+// ReflectionOption configures LoadDescriptorsFromReflection.
+type ReflectionOption func(*reflectionConfig)
+
+type reflectionConfig struct {
+	httpClient connect.HTTPClient
+}
+
+// WithReflectionHTTPClient reuses client for the reflection calls in place of
+// building a new one. A caller that reflects repeatedly should pass the same
+// client every time: each new client brings its own connection pool, and an
+// HTTP/2 connection that no longer has an owner still holds a goroutine and a
+// file descriptor until the peer closes it.
+func WithReflectionHTTPClient(client connect.HTTPClient) ReflectionOption {
+	return func(cfg *reflectionConfig) {
+		cfg.httpClient = client
+	}
+}
+
+// DefaultHTTPClient returns the HTTP client that backend calls to baseURL use
+// when the caller supplies none. Build it once and share it to keep one
+// connection pool for the process.
+func DefaultHTTPClient(baseURL string) connect.HTTPClient {
+	return backendHTTPClient(baseURL, nil)
+}
+
 // LoadDescriptorsFromReflection loads a protobuf FileDescriptorSet from a gRPC
 // server that has reflection enabled.
-func LoadDescriptorsFromReflection(ctx context.Context, baseURL string, headers http.Header, useConnect bool) (*descriptorpb.FileDescriptorSet, error) {
-	httpClient := http.DefaultClient
-	if strings.HasPrefix(baseURL, "http://") {
-		httpClient = insecureClient()
+func LoadDescriptorsFromReflection(ctx context.Context, baseURL string, headers http.Header, useConnect bool, opts ...ReflectionOption) (*descriptorpb.FileDescriptorSet, error) {
+	var rcfg reflectionConfig
+	for _, opt := range opts {
+		opt(&rcfg)
 	}
+	httpClient := backendHTTPClient(baseURL, rcfg.httpClient)
 	connectOpts := connectOptions(useConnect)
 
 	all := map[string]*descriptorpb.FileDescriptorProto{}

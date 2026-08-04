@@ -14,11 +14,14 @@ import (
 // listToolNames sends a tools/list JSON-RPC request to the server and returns the tool names.
 func listToolNames(t *testing.T, srv *server.MCPServer) []string {
 	t.Helper()
-	msg, _ := json.Marshal(mcp.JSONRPCRequest{
+	msg, err := json.Marshal(mcp.JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      mcp.NewRequestId(1),
 		Request: mcp.Request{Method: "tools/list"},
 	})
+	if err != nil {
+		t.Fatalf("marshal tools/list request: %v", err)
+	}
 	resp := srv.HandleMessage(context.Background(), msg)
 	jsonResp, ok := resp.(mcp.JSONRPCResponse)
 	if !ok {

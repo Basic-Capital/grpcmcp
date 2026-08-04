@@ -84,7 +84,7 @@ func TestLoadDescriptorsPrefersDescriptorFileWhenReflectionAlsoSet(t *testing.T)
 		t.Fatalf("write descriptors failed: %v", err)
 	}
 
-	loaded, err := loadDescriptors(t.Context(), path, true, backendURL, nil, false)
+	loaded, err := loadDescriptors(t.Context(), path, true, backendURL, nil, false, grpcmcp.DefaultHTTPClient(backendURL))
 	if err != nil {
 		t.Fatalf("loadDescriptors failed: %v", err)
 	}

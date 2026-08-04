@@ -52,6 +52,12 @@ A simple MCP server that will proxy to a grpc backend based on a provided descri
 
 * `string64` - If set, expose 64-bit protobuf integer fields (`int64`, `uint64`, `sint64`, `fixed64`, `sfixed64`) as strings only in MCP JSON schemas. This avoids precision ambiguity for JavaScript-based clients and agents. By default, schemas continue to allow either JSON numbers or strings for compatibility.
 
+* `refresh-interval` duration - How often to re-run reflection so methods added to the backend appear without a restart. Defaults to `5m`. This applies when `reflect` is set and `descriptors` is not: a descriptor file wins over reflection for the initial load, so a refresh from reflection would replace the set the operator asked for.
+
+* `refresh-timeout` duration - Time limit for one refresh attempt. Defaults to `1m`. A backend that accepts the connection and then stalls would otherwise stop every later refresh.
+
+A refresh that matches no tools leaves the current tool set in place. Reflection can report a reduced service set while a backend rolls, and taking every tool away from each connected client is worse than serving a set that is briefly stale.
+
 grpcmcp currently exposes unary gRPC methods as MCP tools. Backend gRPC client-streaming, server-streaming, and bidi-streaming methods are skipped. This is separate from MCP transports: Streamable HTTP and legacy SSE are supported for client connections to grpcmcp.
 
 ## Library Usage

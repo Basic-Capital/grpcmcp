@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/Basic-Capital/grpcmcp/grpcmcp"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -189,8 +190,15 @@ func main() {
 	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
 	forwardOperatorIdentity := flag.Bool("forward-operator-identity", false, "Copy the X-Operator-Identity header from inbound MCP requests onto outbound gRPC calls. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.")
 	string64 := flag.Bool("string64", false, "Expose 64-bit protobuf integer fields as strings only in JSON schemas")
+	refreshInterval := flag.Duration("refresh-interval", 5*time.Minute, "How often to re-run reflection so new backend methods appear. Applies when reflect is set without descriptors.")
+	refreshTimeout := flag.Duration("refresh-timeout", time.Minute, "Time limit for one reflection refresh attempt")
 
 	flag.Parse()
+
+	if *refreshInterval <= 0 {
+		fmt.Fprint(os.Stderr, "refresh-interval must be greater than 0.\n")
+		os.Exit(-1)
+	}
 
 	var optFieldNum uint32
 	var optValues []uint64
@@ -232,7 +240,12 @@ func main() {
 		os.Exit(-1)
 	}
 
-	descriptorSet, err := loadDescriptors(ctx, *descriptors, *reflect, *baseURL, http.Header(headers), *useConnect)
+	// One client for the whole process. Every reflection call and every tool
+	// call shares its connection pool, so a repeated refresh does not open a new
+	// pool per tick.
+	backendClient := grpcmcp.DefaultHTTPClient(*baseURL)
+
+	descriptorSet, err := loadDescriptors(ctx, *descriptors, *reflect, *baseURL, http.Header(headers), *useConnect, backendClient)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(-1)
@@ -264,11 +277,12 @@ func main() {
 		Descriptors:   descriptorSet,
 		Services:      serviceNames,
 		BaseURL:       *baseURL,
+		HTTPClient:    backendClient,
 		UseConnect:    *useConnect,
 		String64:      *string64,
 		MethodFilter:  methodFilter,
 		ToolName:      toolName,
-		ServerOptions: []server.ServerOption{server.WithToolCapabilities(*reflect)},
+		ServerOptions: []server.ServerOption{server.WithToolCapabilities(true)},
 	}
 	srv, err := grpcmcp.NewServer(cfg)
 	if err != nil {
@@ -276,33 +290,40 @@ func main() {
 		os.Exit(-1)
 	}
 
-	if *reflect {
+	// Only refresh when reflection is the source that loadDescriptors used. A
+	// descriptor file wins over reflection for the initial load, so refreshing
+	// from reflection would replace the curated set the operator asked for.
+	if *reflect && *descriptors == "" {
 		// Periodically re-run reflection so tools track the backend's schema:
 		// new RPCs deployed on the backend appear without restarting grpcmcp.
 		go func() {
-			ticker := time.NewTicker(5 * time.Minute)
+			ticker := time.NewTicker(*refreshInterval)
 			defer ticker.Stop()
+			toolCount := len(srv.ListTools())
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
 				}
-				newDescriptors, err := grpcmcp.LoadDescriptorsFromReflection(ctx, *baseURL, http.Header(headers), *useConnect)
+				count, err := refreshTools(ctx, srv, cfg, refreshParams{
+					baseURL:         *baseURL,
+					headers:         http.Header(headers),
+					useConnect:      *useConnect,
+					backendClient:   backendClient,
+					servicesMap:     servicesMap,
+					methodFilter:    methodFilter,
+					shortNames:      *shortNames,
+					veryShortNames:  *veryShortNames,
+					timeout:         *refreshTimeout,
+					previousToolLen: toolCount,
+				})
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "refresh: %v\n", err)
 					continue
 				}
-				refreshCfg := cfg
-				refreshCfg.Descriptors = newDescriptors
-				refreshCfg.ToolName = buildToolNamer(newDescriptors, servicesMap, methodFilter, *shortNames, *veryShortNames)
-				tools, err := grpcmcp.Tools(refreshCfg)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "refresh: %v\n", err)
-					continue
-				}
-				srv.SetTools(tools...)
-				fmt.Fprintf(os.Stderr, "refresh: %d tools registered\n", len(tools))
+				toolCount = count
+				fmt.Fprintf(os.Stderr, "refresh: %d tools registered\n", count)
 			}
 		}()
 	}
@@ -329,11 +350,11 @@ func main() {
 	}
 }
 
-func loadDescriptors(ctx context.Context, descriptorsPath string, reflect bool, baseURL string, headers http.Header, useConnect bool) (*descriptorpb.FileDescriptorSet, error) {
+func loadDescriptors(ctx context.Context, descriptorsPath string, reflect bool, baseURL string, headers http.Header, useConnect bool, backendClient connect.HTTPClient) (*descriptorpb.FileDescriptorSet, error) {
 	var descriptorSet *descriptorpb.FileDescriptorSet
 	if reflect {
 		var err error
-		descriptorSet, err = grpcmcp.LoadDescriptorsFromReflection(ctx, baseURL, headers, useConnect)
+		descriptorSet, err = grpcmcp.LoadDescriptorsFromReflection(ctx, baseURL, headers, useConnect, grpcmcp.WithReflectionHTTPClient(backendClient))
 		if err != nil {
 			return nil, err
 		}
