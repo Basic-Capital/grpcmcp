@@ -9,7 +9,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	"connectrpc.com/connect"
 	"github.com/Basic-Capital/grpcmcp/grpcmcp"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -66,6 +68,49 @@ func generateToolName(shortNames bool, veryShortNames bool, hasShortCollision bo
 		return fmt.Sprintf("%v__%v", simpleServiceName, methodName)
 	}
 	return strings.ReplaceAll(fmt.Sprintf("%v__%v", fullServiceName, methodName), ".", "_")
+}
+
+// buildToolNamer pre-scans for collisions so --short-names / --very-short-names
+// can fall back: services sharing a simple name keep the full path, and method
+// names defined by multiple services keep the service prefix. Streaming and
+// filtered-out methods are skipped to match the actual set of registered tools.
+// Returns nil (default naming) when neither flag is set.
+func buildToolNamer(fds *descriptorpb.FileDescriptorSet, servicesMap map[string]struct{}, methodFilter func(protoreflect.MethodDescriptor) bool, shortNames bool, veryShortNames bool) func(protoreflect.ServiceDescriptor, protoreflect.MethodDescriptor) string {
+	if !shortNames && !veryShortNames {
+		return nil
+	}
+	simpleNameCount := map[string]int{}
+	methodNameCount := map[string]int{}
+	scanReg := buildRegistry(fds)
+	scanReg.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+		for i := range fd.Services().Len() {
+			s := fd.Services().Get(i)
+			if len(servicesMap) > 0 {
+				if _, found := servicesMap[string(s.FullName())]; !found {
+					continue
+				}
+			}
+			simpleNameCount[string(s.Name())]++
+			if veryShortNames {
+				for j := range s.Methods().Len() {
+					m := s.Methods().Get(j)
+					if m.IsStreamingClient() || m.IsStreamingServer() {
+						continue
+					}
+					if methodFilter != nil && !methodFilter(m) {
+						continue
+					}
+					methodNameCount[string(m.Name())]++
+				}
+			}
+		}
+		return true
+	})
+	return func(s protoreflect.ServiceDescriptor, m protoreflect.MethodDescriptor) string {
+		hasShortCollision := simpleNameCount[string(s.Name())] > 1
+		hasVeryShortCollision := methodNameCount[string(m.Name())] > 1
+		return generateToolName(shortNames, veryShortNames, hasShortCollision, hasVeryShortCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
+	}
 }
 
 func buildRegistry(fds *descriptorpb.FileDescriptorSet) *protoregistry.Files {
@@ -145,8 +190,15 @@ func main() {
 	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
 	forwardOperatorIdentity := flag.Bool("forward-operator-identity", false, "Copy the X-Operator-Identity header from inbound MCP requests onto outbound gRPC calls. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.")
 	string64 := flag.Bool("string64", false, "Expose 64-bit protobuf integer fields as strings only in JSON schemas")
+	refreshInterval := flag.Duration("refresh-interval", 5*time.Minute, "How often to re-run reflection so new backend methods appear. Applies when reflect is set without descriptors.")
+	refreshTimeout := flag.Duration("refresh-timeout", time.Minute, "Time limit for one reflection refresh attempt")
 
 	flag.Parse()
+
+	if *refreshInterval <= 0 {
+		fmt.Fprint(os.Stderr, "refresh-interval must be greater than 0.\n")
+		os.Exit(-1)
+	}
 
 	var optFieldNum uint32
 	var optValues []uint64
@@ -188,7 +240,12 @@ func main() {
 		os.Exit(-1)
 	}
 
-	descriptorSet, err := loadDescriptors(ctx, *descriptors, *reflect, *baseURL, http.Header(headers), *useConnect)
+	// One client for the whole process. Every reflection call and every tool
+	// call shares its connection pool, so a repeated refresh does not open a new
+	// pool per tick.
+	backendClient := grpcmcp.DefaultHTTPClient(*baseURL)
+
+	descriptorSet, err := loadDescriptors(ctx, *descriptors, *reflect, *baseURL, http.Header(headers), *useConnect, backendClient)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(-1)
@@ -206,71 +263,69 @@ func main() {
 		}
 	}
 
-	// Pre-scan for collisions so --short-names / --very-short-names can fall back.
-	// simpleNameCount: how many services share the same simple name (for --short-names)
-	// methodNameCount: how many services define the same method name (for --very-short-names)
-	simpleNameCount := map[string]int{}
-	methodNameCount := map[string]int{}
-	var toolName func(protoreflect.ServiceDescriptor, protoreflect.MethodDescriptor) string
-	if *shortNames || *veryShortNames {
-		scanReg := buildRegistry(descriptorSet)
-		scanReg.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
-			for i := range fd.Services().Len() {
-				s := fd.Services().Get(i)
-				if len(servicesMap) > 0 {
-					if _, found := servicesMap[string(s.FullName())]; !found {
-						continue
-					}
-				}
-				simpleNameCount[string(s.Name())]++
-				if *veryShortNames {
-					// Count how many services define each method name.
-					// If two services both have "GetPlan", that method can't use
-					// the method-only format (e.g. "GetPlan") and must fall back
-					// to include the service prefix (e.g. "WalletService__GetPlan").
-					// We skip streaming and filtered-out methods to match the actual
-					// set of tools that will be registered.
-					for j := range s.Methods().Len() {
-						m := s.Methods().Get(j)
-						if m.IsStreamingClient() || m.IsStreamingServer() {
-							continue
-						}
-						if methodFilter != nil && !methodFilter(m) {
-							continue
-						}
-						methodNameCount[string(m.Name())]++
-					}
-				}
-			}
-			return true
-		})
-		toolName = func(s protoreflect.ServiceDescriptor, m protoreflect.MethodDescriptor) string {
-			hasShortCollision := simpleNameCount[string(s.Name())] > 1
-			hasVeryShortCollision := methodNameCount[string(m.Name())] > 1
-			return generateToolName(*shortNames, *veryShortNames, hasShortCollision, hasVeryShortCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
-		}
-	}
+	toolName := buildToolNamer(descriptorSet, servicesMap, methodFilter, *shortNames, *veryShortNames)
 
 	headersProvider := grpcmcp.StaticHeaders(http.Header(headers))
 	if *forwardOperatorIdentity {
 		headersProvider = operatorIdentityHeaders(headersProvider)
 	}
 
-	srv, err := grpcmcp.NewServer(grpcmcp.Config{
-		Headers:      headersProvider,
-		ServerName:   *serverName,
-		Version:      *serverVersion,
-		Descriptors:  descriptorSet,
-		Services:     serviceNames,
-		BaseURL:      *baseURL,
-		UseConnect:   *useConnect,
-		String64:     *string64,
-		MethodFilter: methodFilter,
-		ToolName:     toolName,
-	})
+	cfg := grpcmcp.Config{
+		Headers:       headersProvider,
+		ServerName:    *serverName,
+		Version:       *serverVersion,
+		Descriptors:   descriptorSet,
+		Services:      serviceNames,
+		BaseURL:       *baseURL,
+		HTTPClient:    backendClient,
+		UseConnect:    *useConnect,
+		String64:      *string64,
+		MethodFilter:  methodFilter,
+		ToolName:      toolName,
+		ServerOptions: []server.ServerOption{server.WithToolCapabilities(true)},
+	}
+	srv, err := grpcmcp.NewServer(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(-1)
+	}
+
+	// Only refresh when reflection is the source that loadDescriptors used. A
+	// descriptor file wins over reflection for the initial load, so refreshing
+	// from reflection would replace the curated set the operator asked for.
+	if *reflect && *descriptors == "" {
+		// Periodically re-run reflection so tools track the backend's schema:
+		// new RPCs deployed on the backend appear without restarting grpcmcp.
+		go func() {
+			ticker := time.NewTicker(*refreshInterval)
+			defer ticker.Stop()
+			toolCount := len(srv.ListTools())
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+				count, err := refreshTools(ctx, srv, cfg, refreshParams{
+					baseURL:         *baseURL,
+					headers:         http.Header(headers),
+					useConnect:      *useConnect,
+					backendClient:   backendClient,
+					servicesMap:     servicesMap,
+					methodFilter:    methodFilter,
+					shortNames:      *shortNames,
+					veryShortNames:  *veryShortNames,
+					timeout:         *refreshTimeout,
+					previousToolLen: toolCount,
+				})
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "refresh: %v\n", err)
+					continue
+				}
+				toolCount = count
+				fmt.Fprintf(os.Stderr, "refresh: %d tools registered\n", count)
+			}
+		}()
 	}
 
 	if *sseHostPort == "" {
@@ -295,11 +350,11 @@ func main() {
 	}
 }
 
-func loadDescriptors(ctx context.Context, descriptorsPath string, reflect bool, baseURL string, headers http.Header, useConnect bool) (*descriptorpb.FileDescriptorSet, error) {
+func loadDescriptors(ctx context.Context, descriptorsPath string, reflect bool, baseURL string, headers http.Header, useConnect bool, backendClient connect.HTTPClient) (*descriptorpb.FileDescriptorSet, error) {
 	var descriptorSet *descriptorpb.FileDescriptorSet
 	if reflect {
 		var err error
-		descriptorSet, err = grpcmcp.LoadDescriptorsFromReflection(ctx, baseURL, headers, useConnect)
+		descriptorSet, err = grpcmcp.LoadDescriptorsFromReflection(ctx, baseURL, headers, useConnect, grpcmcp.WithReflectionHTTPClient(backendClient))
 		if err != nil {
 			return nil, err
 		}

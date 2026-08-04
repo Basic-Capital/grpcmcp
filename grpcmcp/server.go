@@ -48,6 +48,8 @@ type Config struct {
 	// ToolName, when set, overrides the default tool naming
 	// (full service name + "__" + method name, dots replaced).
 	ToolName func(protoreflect.ServiceDescriptor, protoreflect.MethodDescriptor) string
+	// ServerOptions are passed through to server.NewMCPServer.
+	ServerOptions []server.ServerOption
 }
 
 // StaticHeaders returns a ToolHeaderProvider that always returns the supplied
@@ -71,13 +73,39 @@ func LoadDescriptorsFromFile(path string) (*descriptorpb.FileDescriptorSet, erro
 	return &fds, nil
 }
 
+// ReflectionOption configures LoadDescriptorsFromReflection.
+type ReflectionOption func(*reflectionConfig)
+
+type reflectionConfig struct {
+	httpClient connect.HTTPClient
+}
+
+// WithReflectionHTTPClient reuses client for the reflection calls in place of
+// building a new one. A caller that reflects repeatedly should pass the same
+// client every time: each new client brings its own connection pool, and an
+// HTTP/2 connection that no longer has an owner still holds a goroutine and a
+// file descriptor until the peer closes it.
+func WithReflectionHTTPClient(client connect.HTTPClient) ReflectionOption {
+	return func(cfg *reflectionConfig) {
+		cfg.httpClient = client
+	}
+}
+
+// DefaultHTTPClient returns the HTTP client that backend calls to baseURL use
+// when the caller supplies none. Build it once and share it to keep one
+// connection pool for the process.
+func DefaultHTTPClient(baseURL string) connect.HTTPClient {
+	return backendHTTPClient(baseURL, nil)
+}
+
 // LoadDescriptorsFromReflection loads a protobuf FileDescriptorSet from a gRPC
 // server that has reflection enabled.
-func LoadDescriptorsFromReflection(ctx context.Context, baseURL string, headers http.Header, useConnect bool) (*descriptorpb.FileDescriptorSet, error) {
-	httpClient := http.DefaultClient
-	if strings.HasPrefix(baseURL, "http://") {
-		httpClient = insecureClient()
+func LoadDescriptorsFromReflection(ctx context.Context, baseURL string, headers http.Header, useConnect bool, opts ...ReflectionOption) (*descriptorpb.FileDescriptorSet, error) {
+	var rcfg reflectionConfig
+	for _, opt := range opts {
+		opt(&rcfg)
 	}
+	httpClient := backendHTTPClient(baseURL, rcfg.httpClient)
 	connectOpts := connectOptions(useConnect)
 
 	all := map[string]*descriptorpb.FileDescriptorProto{}
@@ -120,6 +148,19 @@ func LoadDescriptorsFromReflection(ctx context.Context, baseURL string, headers 
 
 // NewServer builds an MCP server that exposes unary gRPC methods as tools.
 func NewServer(cfg Config) (*server.MCPServer, error) {
+	tools, err := Tools(cfg)
+	if err != nil {
+		return nil, err
+	}
+	srv := server.NewMCPServer(cfg.ServerName, cfg.Version, cfg.ServerOptions...)
+	srv.AddTools(tools...)
+	return srv, nil
+}
+
+// Tools builds the MCP tools for cfg without constructing a server. It can be
+// used with server.MCPServer.SetTools to replace the tool set when the
+// backend's schema changes.
+func Tools(cfg Config) ([]server.ServerTool, error) {
 	if cfg.Descriptors == nil || len(cfg.Descriptors.GetFile()) == 0 {
 		return nil, fmt.Errorf("descriptors are required")
 	}
@@ -135,8 +176,7 @@ func NewServer(cfg Config) (*server.MCPServer, error) {
 	httpClient := backendHTTPClient(cfg.BaseURL, cfg.HTTPClient)
 	connectOpts := connectOptions(cfg.UseConnect)
 
-	srv := server.NewMCPServer(cfg.ServerName, cfg.Version)
-
+	var tools []server.ServerTool
 	reg := new(protoregistry.Files)
 	for _, f := range cfg.Descriptors.GetFile() {
 		desc, err := protodesc.NewFile(f, reg)
@@ -195,12 +235,15 @@ func NewServer(cfg Config) (*server.MCPServer, error) {
 				if cfg.ToolName != nil {
 					name = cfg.ToolName(s, m)
 				}
-				srv.AddTool(mcp.NewToolWithRawSchema(name, description, rawJSON), toolHandler(c, m.Input(), cfg.Headers))
+				tools = append(tools, server.ServerTool{
+					Tool:    mcp.NewToolWithRawSchema(name, description, rawJSON),
+					Handler: toolHandler(c, m.Input(), cfg.Headers),
+				})
 			}
 		}
 	}
 
-	return srv, nil
+	return tools, nil
 }
 
 func toolHandler(c *connect.Client[dynamicpb.Message, dynamicpb.Message], desc protoreflect.MessageDescriptor, headers ToolHeaderProvider) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
