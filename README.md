@@ -58,6 +58,26 @@ A simple MCP server that will proxy to a grpc backend based on a provided descri
 
 A refresh that matches no tools leaves the current tool set in place. Reflection can report a reduced service set while a backend rolls, and taking every tool away from each connected client is worse than serving a set that is briefly stale.
 
+### TLS
+
+These options apply to the backend connection. They are ignored when `url` is `http://`.
+
+* `client-ca-file` string - PEM roots used to verify the backend certificate.
+
+* `client-tls-crt` string - Client certificate presented to the backend for mTLS. Set with `client-tls-key`.
+
+* `client-tls-key` string - Key for the client certificate presented to the backend.
+
+These options apply to the MCP server that grpcmcp runs when `hostport` is set. They work with both the `http` and the `sse` transport.
+
+* `tls-crt` string - Certificate served by this server. Set with `tls-key` to serve TLS.
+
+* `tls-key` string - Key for the certificate served by this server.
+
+* `ca-file` string - PEM roots used to verify inbound client certificates. This requires every client to present one, so it turns on mTLS. Needs `tls-crt` and `tls-key`.
+
+Reflection uses these options too, so `reflect` works against a backend that needs a custom CA or a client certificate.
+
 grpcmcp currently exposes unary gRPC methods as MCP tools. Backend gRPC client-streaming, server-streaming, and bidi-streaming methods are skipped. This is separate from MCP transports: Streamable HTTP and legacy SSE are supported for client connections to grpcmcp.
 
 ## Library Usage
