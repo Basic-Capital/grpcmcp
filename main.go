@@ -2,105 +2,17 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
-	"slices"
-	"strconv"
 	"strings"
 
-	"connectrpc.com/connect"
-	"connectrpc.com/grpcreflect"
-	"github.com/Basic-Capital/grpcmcp/buf"
-	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/Basic-Capital/grpcmcp/grpcmcp"
 	"github.com/mark3labs/mcp-go/server"
-	"golang.org/x/net/http2"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/encoding/protowire"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
-	"google.golang.org/protobuf/types/dynamicpb"
 )
-
-var protojsonMarshaller = protojson.MarshalOptions{UseProtoNames: true}
-var protojsonUnmarshaller = protojson.UnmarshalOptions{DiscardUnknown: true}
-
-func toolHandler(c *connect.Client[dynamicpb.Message, dynamicpb.Message], desc protoreflect.MessageDescriptor, headers http.Header) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		msg := dynamicpb.NewMessage(desc)
-		b, err := json.Marshal(request.Params.Arguments)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-
-		if err := protojsonUnmarshaller.Unmarshal(b, msg); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		req := connect.NewRequest(msg)
-		if len(headers) > 0 {
-			for k, v := range headers {
-				if len(v) == 1 {
-					req.Header().Set(k, v[0])
-				} else {
-					req.Header().Del(k)
-					for _, v2 := range v {
-						req.Header().Add(k, v2)
-					}
-				}
-			}
-		}
-		resp, err := c.CallUnary(ctx, req)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		res, err := protojsonMarshaller.Marshal(resp.Msg)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return mcp.NewToolResultText(string(res)), nil
-	}
-}
-
-func insecureClient() *http.Client {
-	return &http.Client{
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
-				return net.Dial(network, addr)
-			},
-		},
-	}
-}
-
-var responseInitializer = connect.WithResponseInitializer(func(spec connect.Spec, message any) error {
-	if m, ok := message.(*dynamicpb.Message); ok {
-		desc := spec.Schema.(protoreflect.MethodDescriptor)
-		*m = *dynamicpb.NewMessage(desc.Output())
-	}
-	return nil
-})
-
-func topSort(d *descriptorpb.FileDescriptorProto, all map[string]*descriptorpb.FileDescriptorProto, seen map[string]struct{}, ds *[]*descriptorpb.FileDescriptorProto) {
-	if _, found := seen[d.GetName()]; found {
-		return
-	}
-	seen[d.GetName()] = struct{}{}
-	for _, dep := range d.GetDependency() {
-		v, found := all[dep]
-		if !found {
-			panic("not found: " + dep)
-		}
-		topSort(v, all, seen, ds)
-	}
-	*ds = append(*ds, d)
-}
 
 type headerFlags http.Header
 
@@ -118,80 +30,13 @@ func (s *headerFlags) Set(value string) error {
 	return nil
 }
 
-func generateToolName(shortNames bool, veryShortNames bool, hasShortCollision bool, hasVeryShortCollision bool, fullServiceName string, simpleServiceName string, methodName string) string {
-	if veryShortNames && !hasVeryShortCollision {
-		return methodName
-	}
-	if (shortNames || veryShortNames) && !hasShortCollision {
-		return fmt.Sprintf("%v__%v", simpleServiceName, methodName)
-	}
-	return strings.ReplaceAll(fmt.Sprintf("%v__%v", fullServiceName, methodName), ".", "_")
-}
-
-func buildRegistry(fds *descriptorpb.FileDescriptorSet) *protoregistry.Files {
-	reg := new(protoregistry.Files)
-	for _, f := range fds.GetFile() {
-		fd, err := protodesc.NewFile(f, reg)
-		if err != nil {
-			continue
-		}
-		if _, err := reg.FindFileByPath(fd.Path()); err != nil {
-			reg.RegisterFile(fd)
-		}
-	}
-	return reg
-}
-
-func hasMethodOption(m protoreflect.MethodDescriptor, fieldNum uint32, expectedValues []uint64) bool {
-	opts := m.Options()
-	if opts == nil {
-		return false
-	}
-	b, err := proto.Marshal(opts)
-	if err != nil {
-		return false
-	}
-	for len(b) > 0 {
-		num, wtype, n := protowire.ConsumeTag(b)
-		if n < 0 {
-			return false
-		}
-		b = b[n:]
-		if uint32(num) == fieldNum && wtype == protowire.VarintType {
-			v, vn := protowire.ConsumeVarint(b)
-			if vn < 0 {
-				return false
-			}
-			return slices.Contains(expectedValues, v)
-		}
-		switch wtype {
-		case protowire.VarintType:
-			_, n = protowire.ConsumeVarint(b)
-		case protowire.Fixed32Type:
-			_, n = protowire.ConsumeFixed32(b)
-		case protowire.Fixed64Type:
-			_, n = protowire.ConsumeFixed64(b)
-		case protowire.BytesType:
-			_, n = protowire.ConsumeBytes(b)
-		case protowire.StartGroupType:
-			_, n = protowire.ConsumeGroup(protowire.Number(num), b)
-		default:
-			return false
-		}
-		if n < 0 {
-			return false
-		}
-		b = b[n:]
-	}
-	return false
-}
-
 func main() {
 	headers := make(headerFlags)
 	flag.Var(&headers, "header", "Headers to add to the backend request (Header: Value). Can apply multiple times.")
 	serverName := flag.String("name", "gRPC MCP Server", "Name of MCP Server")
 	serverVersion := flag.String("version", "1.0.0", "Version of MCP Server")
-	sseHostPort := flag.String("hostport", "", "host:port for SSE server, STDIN if not set")
+	sseHostPort := flag.String("hostport", "", "host:port for HTTP server, STDIN if not set")
+	transport := flag.String("transport", "http", "Transport to use when hostport is set: http or sse")
 	descriptors := flag.String("descriptors", "", "Location of the descriptor")
 	reflect := flag.Bool("reflect", false, "Use reflection to get descriptors")
 	services := flag.String("services", "", "If set, a comma separated list of services to expose")
@@ -199,34 +44,21 @@ func main() {
 	bearerEnv := flag.String("bearer-env", "", "Environment variable for token to use in an Authorization bearer header")
 	baseURL := flag.String("url", "http://localhost:8090", "The url of the backend")
 	useConnect := flag.Bool("connect", false, "Use connect protocol (instead of gRPC)")
+	string64 := flag.Bool("string64", false, "Expose 64-bit protobuf integer fields as strings only in JSON schemas")
 	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value or fieldNumber:value1,value2, e.g. 50003:1 or 50003:1,2)")
 	shortNames := flag.Bool("short-names", false, "Use short tool names (ServiceName__MethodName instead of full package path). Saves tokens when used with LLM agents that list all tool names in context.")
 	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
 
 	flag.Parse()
 
-	var optFieldNum uint32
-	var optValues []uint64
+	var methodOption *grpcmcp.MethodOptionFilter
 	if *requireMethodOption != "" {
-		parts := strings.SplitN(*requireMethodOption, ":", 2)
-		if len(parts) != 2 {
-			fmt.Fprint(os.Stderr, "require-method-option must be in the format fieldNumber:value or fieldNumber:value1,value2\n")
-			os.Exit(-1)
-		}
-		fn, err := strconv.ParseUint(parts[0], 10, 32)
+		var err error
+		methodOption, err = grpcmcp.ParseMethodOptionFilter(*requireMethodOption)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid field number in require-method-option: %v\n", err)
+			fmt.Fprintf(os.Stderr, "invalid require-method-option: %v\n", err)
 			os.Exit(-1)
 		}
-		for _, valStr := range strings.Split(parts[1], ",") {
-			val, err := strconv.ParseUint(valStr, 10, 64)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "invalid value in require-method-option: %v\n", err)
-				os.Exit(-1)
-			}
-			optValues = append(optValues, val)
-		}
-		optFieldNum = uint32(fn)
 	}
 
 	if *bearerEnv != "" {
@@ -237,14 +69,6 @@ func main() {
 		http.Header(headers).Set("Authorization", "Bearer "+*bearer)
 	}
 
-	servicesMap := map[string]struct{}{}
-	if len(*services) > 0 {
-		servicesSplit := strings.Split(*services, ",")
-		for _, s := range servicesSplit {
-			servicesMap[s] = struct{}{}
-		}
-	}
-
 	ctx := context.Background()
 
 	if *descriptors == "" && !*reflect {
@@ -253,156 +77,80 @@ func main() {
 		os.Exit(-1)
 	}
 
-	httpClient := http.DefaultClient
-	if strings.HasPrefix(*baseURL, "http://") {
-		httpClient = insecureClient()
+	descriptorSet, err := loadDescriptors(ctx, *descriptors, *reflect, *baseURL, http.Header(headers), *useConnect)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		os.Exit(-1)
 	}
-	var connectOpts []connect.ClientOption
-	connectOpts = append(connectOpts, responseInitializer)
-	if !*useConnect {
-		connectOpts = append(connectOpts, connect.WithGRPC())
-	}
+	serviceNames := parseServices(*services)
 
-	srv := server.NewMCPServer(*serverName, *serverVersion)
+	srv, err := grpcmcp.NewServer(grpcmcp.Config{
+		Headers:     grpcmcp.StaticHeaders(http.Header(headers)),
+		ServerName:  *serverName,
+		Version:     *serverVersion,
+		Descriptors: descriptorSet,
+		Services:    serviceNames,
+		BaseURL:     *baseURL,
+		UseConnect:  *useConnect,
+		String64:    *string64,
 
-	var fds descriptorpb.FileDescriptorSet
-
-	if *reflect {
-		all := map[string]*descriptorpb.FileDescriptorProto{}
-		client := grpcreflect.NewClient(httpClient, *baseURL, connectOpts...)
-		stream := client.NewStream(ctx, grpcreflect.WithRequestHeaders(http.Header(headers)))
-		names, err := stream.ListServices()
-		if err != nil {
-			panic(err)
-		}
-		for _, name := range names {
-			fileDescriptors, err := stream.FileContainingSymbol(name)
-			if err != nil {
-				panic(err)
-			}
-			for _, d := range fileDescriptors {
-				all[d.GetName()] = d
-			}
-		}
-		_, err = stream.Close()
-		if err != nil {
-			panic(err)
-		}
-		var ds []*descriptorpb.FileDescriptorProto
-		seen := map[string]struct{}{}
-		for _, d := range all {
-			topSort(d, all, seen, &ds)
-		}
-		fds.File = ds
-	}
-
-	if *descriptors != "" {
-		b, err := os.ReadFile(*descriptors)
-		if err != nil {
-			panic(err)
-		}
-		if err := proto.Unmarshal(b, &fds); err != nil {
-			panic(err)
-		}
-	}
-
-	// Pre-scan for collisions so --short-names / --very-short-names can fall back.
-	// simpleNameCount: how many services share the same simple name (for --short-names)
-	// methodNameCount: how many services define the same method name (for --very-short-names)
-	simpleNameCount := map[string]int{}
-	methodNameCount := map[string]int{}
-	if *shortNames || *veryShortNames {
-		scanReg := buildRegistry(&fds)
-		scanReg.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
-			for i := range fd.Services().Len() {
-				s := fd.Services().Get(i)
-				if len(servicesMap) > 0 {
-					if _, found := servicesMap[string(s.FullName())]; !found {
-						continue
-					}
-				}
-				simpleNameCount[string(s.Name())]++
-				if *veryShortNames {
-					// Count how many services define each method name.
-					// If two services both have "GetPlan", that method can't use
-					// the method-only format (e.g. "GetPlan") and must fall back
-					// to include the service prefix (e.g. "WalletService__GetPlan").
-					// We skip streaming and filtered-out methods to match the actual
-					// set of tools that will be registered.
-					for j := range s.Methods().Len() {
-						m := s.Methods().Get(j)
-						if m.IsStreamingClient() || m.IsStreamingServer() {
-							continue
-						}
-						if optFieldNum > 0 && !hasMethodOption(m, optFieldNum, optValues) {
-							continue
-						}
-						methodNameCount[string(m.Name())]++
-					}
-				}
-			}
-			return true
-		})
-	}
-
-	reg := buildRegistry(&fds)
-	reg.RangeFiles(func(desc protoreflect.FileDescriptor) bool {
-		services := desc.Services()
-		for i := range services.Len() {
-			s := services.Get(i)
-			if len(servicesMap) > 0 {
-				if _, found := servicesMap[string(s.FullName())]; !found {
-					continue
-				}
-			}
-			methods := s.Methods()
-			for j := range methods.Len() {
-				m := methods.Get(j)
-				if m.IsStreamingClient() || m.IsStreamingServer() {
-					// Currently don't support streaming
-					continue
-				}
-				if optFieldNum > 0 && !hasMethodOption(m, optFieldNum, optValues) {
-					continue
-				}
-				input := buf.Generate(m.Input())
-				j, err := json.Marshal(input)
-				if err != nil {
-					panic(err)
-				}
-				var rawJson json.RawMessage
-				if err := rawJson.UnmarshalJSON(j); err != nil {
-					panic(err)
-				}
-				src := desc.SourceLocations().ByDescriptor(m)
-				var descriptions []string
-				if src.LeadingComments != "" {
-					descriptions = append(descriptions, strings.TrimSpace(src.LeadingComments))
-				}
-				if src.TrailingComments != "" {
-					descriptions = append(descriptions, strings.TrimSpace(src.TrailingComments))
-				}
-				procedure := fmt.Sprintf("/%v/%v", s.FullName(), m.Name())
-				description := strings.Join(descriptions, " | ")
-				c := connect.NewClient[dynamicpb.Message, dynamicpb.Message](httpClient, *baseURL+procedure, connect.WithSchema(m), connect.WithClientOptions(connectOpts...))
-
-				hasShortCollision := simpleNameCount[string(s.Name())] > 1
-				hasVeryShortCollision := methodNameCount[string(m.Name())] > 1
-				name := generateToolName(*shortNames, *veryShortNames, hasShortCollision, hasVeryShortCollision, string(s.FullName()), string(s.Name()), string(m.Name()))
-				srv.AddTool(mcp.NewToolWithRawSchema(name, description, rawJson), toolHandler(c, m.Input(), http.Header(headers)))
-			}
-		}
-		return true
+		MethodOption:   methodOption,
+		ShortNames:     *shortNames,
+		VeryShortNames: *veryShortNames,
 	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		os.Exit(-1)
+	}
 
 	if *sseHostPort == "" {
 		if err := server.ServeStdio(srv); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		}
 	} else {
-		sseSrv := server.NewSSEServer(srv)
-		if err := sseSrv.Start(*sseHostPort); err != nil {
+		var err error
+		switch *transport {
+		case "http", "streamable-http":
+			httpSrv := server.NewStreamableHTTPServer(srv)
+			err = httpSrv.Start(*sseHostPort)
+		case "sse":
+			sseSrv := server.NewSSEServer(srv)
+			err = sseSrv.Start(*sseHostPort)
+		default:
+			err = fmt.Errorf("unknown transport %q: expected http, streamable-http, or sse", *transport)
+		}
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		}
 	}
+}
+
+func loadDescriptors(ctx context.Context, descriptorsPath string, reflect bool, baseURL string, headers http.Header, useConnect bool) (*descriptorpb.FileDescriptorSet, error) {
+	var descriptorSet *descriptorpb.FileDescriptorSet
+	if reflect {
+		var err error
+		descriptorSet, err = grpcmcp.LoadDescriptorsFromReflection(ctx, baseURL, headers, useConnect)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if descriptorsPath != "" {
+		return grpcmcp.LoadDescriptorsFromFile(descriptorsPath)
+	}
+	return descriptorSet, nil
+}
+
+func parseServices(services string) []protoreflect.FullName {
+	if services == "" {
+		return nil
+	}
+	parts := strings.Split(services, ",")
+	result := make([]protoreflect.FullName, 0, len(parts))
+	for _, service := range parts {
+		service = strings.TrimSpace(service)
+		if service != "" {
+			result = append(result, protoreflect.FullName(service))
+		}
+	}
+	return result
 }

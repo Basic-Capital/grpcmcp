@@ -1,298 +1,503 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	"connectrpc.com/grpchealth"
+	"connectrpc.com/grpcreflect"
+	"github.com/Basic-Capital/grpcmcp/grpcmcp"
+	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
+	mcpserver "github.com/mark3labs/mcp-go/server"
+	jsonschemav6 "github.com/santhosh-tekuri/jsonschema/v6"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-func buildFileDescriptor(pkg string, serviceName string, methods []string) *descriptorpb.FileDescriptorProto {
-	var methodDescs []*descriptorpb.MethodDescriptorProto
-	for _, m := range methods {
-		methodDescs = append(methodDescs, &descriptorpb.MethodDescriptorProto{
-			Name:       proto.String(m),
-			InputType:  proto.String(".google.protobuf.Empty"),
-			OutputType: proto.String(".google.protobuf.Empty"),
-		})
+const healthCheckTool = "grpc_health_v1_Health__Check"
+const healthWatchTool = "grpc_health_v1_Health__Watch"
+
+func TestBuildMCPServerFromReflectionExposesUnaryToolsAndSkipsStreaming(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	srv := buildReflectedTestServer(t, backendURL)
+
+	tools := srv.ListTools()
+	if _, ok := tools[healthCheckTool]; !ok {
+		t.Fatalf("expected unary health check tool %q, got tools %v", healthCheckTool, toolNames(tools))
 	}
-	return &descriptorpb.FileDescriptorProto{
-		Name:       proto.String(pkg + "/" + serviceName + ".proto"),
-		Package:    proto.String(pkg),
-		Syntax:     proto.String("proto3"),
-		Dependency: []string{"google/protobuf/empty.proto"},
-		Service: []*descriptorpb.ServiceDescriptorProto{
-			{
-				Name:   proto.String(serviceName),
-				Method: methodDescs,
-			},
-		},
+	if _, ok := tools[healthWatchTool]; ok {
+		t.Fatalf("streaming health watch tool %q should not be exposed", healthWatchTool)
 	}
 }
 
-func buildEmptyFileDescriptor() *descriptorpb.FileDescriptorProto {
-	// google/protobuf/empty.proto for dependency resolution
-	fd, _ := (&emptypb.Empty{}).ProtoReflect().Descriptor().ParentFile().Options().(*descriptorpb.FileOptions)
-	_ = fd
-	return &descriptorpb.FileDescriptorProto{
-		Name:    proto.String("google/protobuf/empty.proto"),
-		Package: proto.String("google.protobuf"),
-		Syntax:  proto.String("proto3"),
-		MessageType: []*descriptorpb.DescriptorProto{
-			{
-				Name: proto.String("Empty"),
-			},
-		},
-	}
+func TestReflectedUnaryToolCallsBackend(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	srv := buildReflectedTestServer(t, backendURL)
+	client := startInProcessClient(t, srv)
+
+	assertHealthCheckToolCall(t, client)
 }
 
-// methodWithVarintOption builds a MethodDescriptor that has an unknown varint
-// field (fieldNum) set to value. This lets us test hasMethodOption without
-// needing a real protobuf extension registration.
-func methodWithVarintOption(fieldNum uint32, value uint64) protoreflect.MethodDescriptor {
-	var buf []byte
-	buf = protowire.AppendTag(buf, protowire.Number(fieldNum), protowire.VarintType)
-	buf = protowire.AppendVarint(buf, value)
-
-	opts := &descriptorpb.MethodOptions{}
-	opts.ProtoReflect().SetUnknown(protoreflect.RawFields(buf))
-
-	fd := &descriptorpb.FileDescriptorProto{
-		Name:    proto.String("test_option.proto"),
-		Package: proto.String("test"),
-		Syntax:  proto.String("proto3"),
-		Dependency: []string{"google/protobuf/empty.proto"},
-		Service: []*descriptorpb.ServiceDescriptorProto{
-			{
-				Name: proto.String("TestOptionService"),
-				Method: []*descriptorpb.MethodDescriptorProto{
-					{
-						Name:       proto.String("TestOptionMethod"),
-						InputType:  proto.String(".google.protobuf.Empty"),
-						OutputType: proto.String(".google.protobuf.Empty"),
-						Options:    opts,
-					},
-				},
-			},
-		},
-	}
-
-	emptyFd := buildEmptyFileDescriptor()
-	fds := &descriptorpb.FileDescriptorSet{
-		File: []*descriptorpb.FileDescriptorProto{emptyFd, fd},
-	}
-	reg := buildRegistry(fds)
-	fileDesc, err := reg.FindFileByPath("test_option.proto")
+func TestLoadDescriptorsFromFileBuildsServer(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	descriptors := loadReflectedDescriptors(t, backendURL)
+	data, err := proto.Marshal(descriptors)
 	if err != nil {
-		panic("methodWithVarintOption: failed to find file: " + err.Error())
+		t.Fatalf("marshal descriptors failed: %v", err)
 	}
-	return fileDesc.Services().Get(0).Methods().Get(0)
+	path := filepath.Join(t.TempDir(), "descriptors.pb")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write descriptors failed: %v", err)
+	}
+
+	loaded, err := grpcmcp.LoadDescriptorsFromFile(path)
+	if err != nil {
+		t.Fatalf("LoadDescriptorsFromFile failed: %v", err)
+	}
+	srv := buildTestServerFromDescriptors(t, backendURL, loaded, []protoreflect.FullName{protoreflect.FullName(grpchealth.HealthV1ServiceName)})
+	client := startInProcessClient(t, srv)
+
+	assertHealthCheckToolCall(t, client)
 }
 
-func TestToolNameGeneration(t *testing.T) {
-	tests := []struct {
-		name       string
-		shortNames bool
-		pkg        string
-		service    string
-		method     string
-		wantName   string
-	}{
-		{
-			name:       "full name by default",
-			shortNames: false,
-			pkg:        "com.example.systems.wallet",
-			service:    "WalletService",
-			method:     "GetPlan",
-			wantName:   "com_example_systems_wallet_WalletService__GetPlan",
-		},
-		{
-			name:       "short name strips package prefix",
-			shortNames: true,
-			pkg:        "com.example.systems.wallet",
-			service:    "WalletService",
-			method:     "GetPlan",
-			wantName:   "WalletService__GetPlan",
-		},
-		{
-			name:       "full name has dots replaced with underscores",
-			shortNames: false,
-			pkg:        "com.example.deeply.nested.pkg",
-			service:    "MyService",
-			method:     "DoThing",
-			wantName:   "com_example_deeply_nested_pkg_MyService__DoThing",
-		},
-		{
-			name:       "short name has no dots to replace",
-			shortNames: true,
-			pkg:        "com.example.deeply.nested.pkg",
-			service:    "MyService",
-			method:     "DoThing",
-			wantName:   "MyService__DoThing",
-		},
+func TestLoadDescriptorsPrefersDescriptorFileWhenReflectionAlsoSet(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	data, err := proto.Marshal(&descriptorpb.FileDescriptorSet{})
+	if err != nil {
+		t.Fatalf("marshal descriptors failed: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "descriptors.pb")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write descriptors failed: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := generateToolName(tt.shortNames, false, false, false, tt.pkg+"."+tt.service, tt.service, string(tt.method))
-			if got != tt.wantName {
-				t.Errorf("generateToolName() = %q, want %q", got, tt.wantName)
-			}
-		})
+	loaded, err := loadDescriptors(t.Context(), path, true, backendURL, nil, false)
+	if err != nil {
+		t.Fatalf("loadDescriptors failed: %v", err)
+	}
+	if got := len(loaded.GetFile()); got != 0 {
+		t.Fatalf("loaded %d descriptor files, want descriptor file to override reflection", got)
 	}
 }
 
-func TestToolNameCollisionFallback(t *testing.T) {
-	// When short-name collision is detected, even with shortNames=true, should use full name
-	got := generateToolName(true, false, true, false, "com.example.pkg1.FooService", "FooService", "GetBar")
-	want := "com_example_pkg1_FooService__GetBar"
-	if got != want {
-		t.Errorf("generateToolName() with collision = %q, want %q", got, want)
+func TestStreamableHTTPTransportListsAndCallsReflectedTools(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	srv := buildReflectedTestServer(t, backendURL)
+	httpSrv := mcpserver.NewTestStreamableHTTPServer(srv)
+	t.Cleanup(httpSrv.Close)
+
+	trans, err := transport.NewStreamableHTTP(httpSrv.URL + "/mcp")
+	if err != nil {
+		t.Fatalf("NewStreamableHTTP failed: %v", err)
+	}
+	client := mcpclient.NewClient(trans)
+	startAndInitializeClient(t, client)
+
+	tools, err := client.ListTools(t.Context(), mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	if !hasTool(tools.Tools, healthCheckTool) {
+		t.Fatalf("expected Streamable HTTP tools list to include %q, got %+v", healthCheckTool, tools.Tools)
+	}
+	if hasTool(tools.Tools, healthWatchTool) {
+		t.Fatalf("streaming tool %q should not be listed over Streamable HTTP", healthWatchTool)
+	}
+
+	assertHealthCheckToolCall(t, client)
+}
+
+func TestStreamableHTTPToolInputSchemasCompileAndValidate(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	srv := buildReflectedTestServer(t, backendURL)
+	httpSrv := mcpserver.NewTestStreamableHTTPServer(srv)
+	t.Cleanup(httpSrv.Close)
+
+	trans, err := transport.NewStreamableHTTP(httpSrv.URL + "/mcp")
+	if err != nil {
+		t.Fatalf("NewStreamableHTTP failed: %v", err)
+	}
+	client := mcpclient.NewClient(trans)
+	startAndInitializeClient(t, client)
+
+	tools, err := client.ListTools(t.Context(), mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	if len(tools.Tools) == 0 {
+		t.Fatal("expected at least one tool")
+	}
+
+	var healthCheckSchema *jsonschemav6.Schema
+	for _, tool := range tools.Tools {
+		schema := compileToolInputSchema(t, tool)
+		if tool.Name == healthCheckTool {
+			healthCheckSchema = schema
+		}
+	}
+	if healthCheckSchema == nil {
+		t.Fatalf("expected tools list to include %q, got %+v", healthCheckTool, tools.Tools)
+	}
+
+	assertSchemaValid(t, healthCheckSchema, map[string]any{
+		"service": grpchealth.HealthV1ServiceName,
+	})
+	assertSchemaValid(t, healthCheckSchema, map[string]any{})
+	assertSchemaInvalid(t, healthCheckSchema, map[string]any{
+		"service": 123,
+	})
+	assertSchemaInvalid(t, healthCheckSchema, map[string]any{
+		"unknown": "value",
+	})
+}
+
+func TestLegacySSETransportListsAndCallsReflectedTools(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	srv := buildReflectedTestServer(t, backendURL)
+	sseSrv := mcpserver.NewTestServer(srv)
+	t.Cleanup(sseSrv.Close)
+
+	client, err := mcpclient.NewSSEMCPClient(sseSrv.URL + "/sse")
+	if err != nil {
+		t.Fatalf("NewSSEMCPClient failed: %v", err)
+	}
+	startAndInitializeClient(t, client)
+
+	tools, err := client.ListTools(t.Context(), mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	if !hasTool(tools.Tools, healthCheckTool) {
+		t.Fatalf("expected SSE tools list to include %q, got %+v", healthCheckTool, tools.Tools)
+	}
+	if hasTool(tools.Tools, healthWatchTool) {
+		t.Fatalf("streaming tool %q should not be listed over SSE", healthWatchTool)
+	}
+
+	assertHealthCheckToolCall(t, client)
+}
+
+func TestDynamicHeaderProviderReceivesInboundToolRequestHeaders(t *testing.T) {
+	const token = "Bearer caller-token"
+
+	backendURL := startReflectingHealthBackendWithAuth(t, token)
+	descriptors, err := grpcmcp.LoadDescriptorsFromReflection(t.Context(), backendURL, nil, false)
+	if err != nil {
+		t.Fatalf("LoadDescriptorsFromReflection failed: %v", err)
+	}
+	srv, err := grpcmcp.NewServer(grpcmcp.Config{
+		Headers: func(ctx context.Context, req mcp.CallToolRequest) (http.Header, error) {
+			headers := make(http.Header)
+			headers.Set("Authorization", req.Header.Get("Authorization"))
+			return headers, nil
+		},
+		ServerName:  "test grpc mcp",
+		Version:     "test",
+		Descriptors: descriptors,
+		Services:    []protoreflect.FullName{protoreflect.FullName(grpchealth.HealthV1ServiceName)},
+		BaseURL:     backendURL,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	httpSrv := mcpserver.NewTestStreamableHTTPServer(srv)
+	t.Cleanup(httpSrv.Close)
+
+	trans, err := transport.NewStreamableHTTP(httpSrv.URL+"/mcp", transport.WithHTTPHeaders(map[string]string{
+		"Authorization": token,
+	}))
+	if err != nil {
+		t.Fatalf("NewStreamableHTTP failed: %v", err)
+	}
+	client := mcpclient.NewClient(trans)
+	startAndInitializeClient(t, client)
+
+	assertHealthCheckToolCall(t, client)
+}
+
+func TestNewServerUsesConfiguredHTTPClient(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	descriptors := loadReflectedDescriptors(t, backendURL)
+	recordingClient := &recordingHTTPClient{client: http.DefaultClient}
+	srv, err := grpcmcp.NewServer(grpcmcp.Config{
+		Headers:     grpcmcp.StaticHeaders(nil),
+		ServerName:  "test grpc mcp",
+		Version:     "test",
+		Descriptors: descriptors,
+		Services:    []protoreflect.FullName{protoreflect.FullName(grpchealth.HealthV1ServiceName)},
+		BaseURL:     backendURL,
+		HTTPClient:  recordingClient,
+		UseConnect:  true,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	client := startInProcessClient(t, srv)
+
+	assertHealthCheckToolCall(t, client)
+	if got := recordingClient.calls.Load(); got == 0 {
+		t.Fatal("expected configured HTTP client to be used")
 	}
 }
 
-func TestVeryShortNames(t *testing.T) {
-	tests := []struct {
-		name                  string
-		hasShortCollision     bool
-		hasVeryShortCollision bool
-		fullServiceName       string
-		simpleServiceName     string
-		methodName            string
-		wantName              string
-	}{
-		{
-			name:              "method-only when no collision",
-			fullServiceName:   "com.example.wallet.WalletService",
-			simpleServiceName: "WalletService",
-			methodName:        "GetPlan",
-			wantName:          "GetPlan",
-		},
-		{
-			name:                  "falls back to service__method when method name collides",
-			hasVeryShortCollision: true,
-			fullServiceName:       "com.example.wallet.WalletService",
-			simpleServiceName:     "WalletService",
-			methodName:            "GetPlan",
-			wantName:              "WalletService__GetPlan",
-		},
-		{
-			name:                  "falls back to full name when both method and service name collide",
-			hasShortCollision:     true,
-			hasVeryShortCollision: true,
-			fullServiceName:       "com.example.wallet.WalletService",
-			simpleServiceName:     "WalletService",
-			methodName:            "GetPlan",
-			wantName:              "com_example_wallet_WalletService__GetPlan",
-		},
+func assertHealthCheckToolCall(t *testing.T, client *mcpclient.Client) {
+	t.Helper()
+
+	req := mcp.CallToolRequest{}
+	req.Params.Name = healthCheckTool
+	req.Params.Arguments = map[string]any{
+		"service": grpchealth.HealthV1ServiceName,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := generateToolName(false, true, tt.hasShortCollision, tt.hasVeryShortCollision, tt.fullServiceName, tt.simpleServiceName, tt.methodName)
-			if got != tt.wantName {
-				t.Errorf("generateToolName() = %q, want %q", got, tt.wantName)
-			}
-		})
+	result, err := client.CallTool(t.Context(), req)
+	if err != nil {
+		t.Fatalf("CallTool failed: %v", err)
+	}
+	if result.IsError {
+		text, _ := toolResultText(result)
+		t.Fatalf("CallTool returned tool error: %s", text)
+	}
+
+	text, err := toolResultText(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(text), &response); err != nil {
+		t.Fatalf("response was not JSON: %v; text=%q", err, text)
+	}
+	if response.Status != "SERVING" {
+		t.Fatalf("expected SERVING status, got %q in %s", response.Status, text)
 	}
 }
 
-func TestHasMethodOption(t *testing.T) {
-	tests := []struct {
-		name           string
-		opts           *descriptorpb.MethodOptions
-		fieldNum       uint32
-		expectedValues []uint64
-		want           bool
-	}{
-		{
-			name:           "nil options returns false",
-			opts:           nil,
-			fieldNum:       50003,
-			expectedValues: []uint64{1},
-			want:           false,
-		},
-		{
-			name:           "empty options returns false",
-			opts:           &descriptorpb.MethodOptions{},
-			fieldNum:       50003,
-			expectedValues: []uint64{1},
-			want:           false,
-		},
+type recordingHTTPClient struct {
+	client *http.Client
+	calls  atomic.Int64
+}
+
+func (c *recordingHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	c.calls.Add(1)
+	return c.client.Do(req)
+}
+
+func compileToolInputSchema(t *testing.T, tool mcp.Tool) *jsonschemav6.Schema {
+	t.Helper()
+
+	data, err := json.Marshal(tool)
+	if err != nil {
+		t.Fatalf("marshal tool %q failed: %v", tool.Name, err)
+	}
+	var rawTool map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawTool); err != nil {
+		t.Fatalf("unmarshal tool %q failed: %v", tool.Name, err)
+	}
+	rawSchema, ok := rawTool["inputSchema"]
+	if !ok {
+		t.Fatalf("tool %q did not include inputSchema: %s", tool.Name, data)
+	}
+	var schemaDoc any
+	if err := json.Unmarshal(rawSchema, &schemaDoc); err != nil {
+		t.Fatalf("tool %q inputSchema is not JSON: %v; schema=%s", tool.Name, err, rawSchema)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fd := &descriptorpb.FileDescriptorProto{
-				Name:    proto.String("test.proto"),
-				Package: proto.String("test"),
-				Syntax:  proto.String("proto3"),
-				Service: []*descriptorpb.ServiceDescriptorProto{
-					{
-						Name: proto.String("TestService"),
-						Method: []*descriptorpb.MethodDescriptorProto{
-							{
-								Name:       proto.String("TestMethod"),
-								InputType:  proto.String(".google.protobuf.Empty"),
-								OutputType: proto.String(".google.protobuf.Empty"),
-								Options:    tt.opts,
-							},
-						},
-					},
-				},
-				Dependency: []string{"google/protobuf/empty.proto"},
-			}
+	compiler := jsonschemav6.NewCompiler()
+	schemaURL := tool.Name + ".schema.json"
+	if err := compiler.AddResource(schemaURL, schemaDoc); err != nil {
+		t.Fatalf("add inputSchema for tool %q failed: %v; schema=%s", tool.Name, err, rawSchema)
+	}
+	schema, err := compiler.Compile(schemaURL)
+	if err != nil {
+		t.Fatalf("compile inputSchema for tool %q failed: %v; schema=%s", tool.Name, err, rawSchema)
+	}
+	return schema
+}
 
-			emptyFd := buildEmptyFileDescriptor()
-			fds := &descriptorpb.FileDescriptorSet{
-				File: []*descriptorpb.FileDescriptorProto{emptyFd, fd},
-			}
+func assertSchemaValid(t *testing.T, schema *jsonschemav6.Schema, value any) {
+	t.Helper()
 
-			reg := buildRegistry(fds)
-			fileDesc, err := reg.FindFileByPath("test.proto")
-			if err != nil {
-				t.Fatalf("failed to find file: %v", err)
-			}
-
-			method := fileDesc.Services().Get(0).Methods().Get(0)
-			got := hasMethodOption(method, tt.fieldNum, tt.expectedValues)
-			if got != tt.want {
-				t.Errorf("hasMethodOption() = %v, want %v", got, tt.want)
-			}
-		})
+	if err := schema.Validate(value); err != nil {
+		t.Fatalf("expected schema to accept %#v: %v", value, err)
 	}
 }
 
-func TestHasMethodOptionMultiValue(t *testing.T) {
-	// Method has option field 50003 set to value 2.
-	method := methodWithVarintOption(50003, 2)
+func assertSchemaInvalid(t *testing.T, schema *jsonschemav6.Schema, value any) {
+	t.Helper()
 
-	tests := []struct {
-		name           string
-		expectedValues []uint64
-		want           bool
-	}{
-		{
-			name:           "value 2 matches slice containing 1 and 2",
-			expectedValues: []uint64{1, 2},
-			want:           true,
-		},
-		{
-			name:           "value 2 does not match slice containing only 1",
-			expectedValues: []uint64{1},
-			want:           false,
-		},
+	if err := schema.Validate(value); err == nil {
+		t.Fatalf("expected schema to reject %#v", value)
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := hasMethodOption(method, 50003, tt.expectedValues)
-			if got != tt.want {
-				t.Errorf("hasMethodOption() = %v, want %v", got, tt.want)
-			}
-		})
+func TestServiceFilterLimitsReflectedTools(t *testing.T) {
+	backendURL := startReflectingHealthBackend(t)
+	descriptors, err := grpcmcp.LoadDescriptorsFromReflection(t.Context(), backendURL, nil, false)
+	if err != nil {
+		t.Fatalf("LoadDescriptorsFromReflection failed: %v", err)
 	}
+	srv, err := grpcmcp.NewServer(grpcmcp.Config{
+		Headers:     grpcmcp.StaticHeaders(nil),
+		ServerName:  "test grpc mcp",
+		Version:     "test",
+		Descriptors: descriptors,
+		Services:    []protoreflect.FullName{"missing.Service"},
+		BaseURL:     backendURL,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	if tools := srv.ListTools(); len(tools) != 0 {
+		t.Fatalf("expected service filter to hide all tools, got %v", toolNames(tools))
+	}
+}
+
+func startReflectingHealthBackend(t *testing.T) string {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	health := grpchealth.NewStaticChecker(grpchealth.HealthV1ServiceName)
+	reflector := grpcreflect.NewStaticReflector(grpchealth.HealthV1ServiceName)
+	path, handler := grpchealth.NewHandler(health)
+	mux.Handle(path, handler)
+	mux.Handle(grpcreflect.NewHandlerV1(reflector))
+	mux.Handle(grpcreflect.NewHandlerV1Alpha(reflector))
+
+	srv := httptest.NewUnstartedServer(h2c.NewHandler(mux, &http2.Server{}))
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func startReflectingHealthBackendWithAuth(t *testing.T, wantAuthorization string) string {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	health := grpchealth.NewStaticChecker(grpchealth.HealthV1ServiceName)
+	reflector := grpcreflect.NewStaticReflector(grpchealth.HealthV1ServiceName)
+	path, handler := grpchealth.NewHandler(health)
+	mux.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != wantAuthorization {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	mux.Handle(grpcreflect.NewHandlerV1(reflector))
+	mux.Handle(grpcreflect.NewHandlerV1Alpha(reflector))
+
+	srv := httptest.NewUnstartedServer(h2c.NewHandler(mux, &http2.Server{}))
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func buildReflectedTestServer(t *testing.T, backendURL string) *mcpserver.MCPServer {
+	t.Helper()
+
+	descriptors := loadReflectedDescriptors(t, backendURL)
+	return buildTestServerFromDescriptors(t, backendURL, descriptors, []protoreflect.FullName{protoreflect.FullName(grpchealth.HealthV1ServiceName)})
+}
+
+func loadReflectedDescriptors(t *testing.T, backendURL string) *descriptorpb.FileDescriptorSet {
+	t.Helper()
+
+	descriptors, err := grpcmcp.LoadDescriptorsFromReflection(t.Context(), backendURL, nil, false)
+	if err != nil {
+		t.Fatalf("LoadDescriptorsFromReflection failed: %v", err)
+	}
+	return descriptors
+}
+
+func buildTestServerFromDescriptors(t *testing.T, backendURL string, descriptors *descriptorpb.FileDescriptorSet, services []protoreflect.FullName) *mcpserver.MCPServer {
+	t.Helper()
+
+	srv, err := grpcmcp.NewServer(grpcmcp.Config{
+		Headers:     grpcmcp.StaticHeaders(nil),
+		ServerName:  "test grpc mcp",
+		Version:     "test",
+		Descriptors: descriptors,
+		Services:    services,
+		BaseURL:     backendURL,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	return srv
+}
+
+func startInProcessClient(t *testing.T, srv *mcpserver.MCPServer) *mcpclient.Client {
+	t.Helper()
+
+	client, err := mcpclient.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatalf("NewInProcessClient failed: %v", err)
+	}
+	startAndInitializeClient(t, client)
+	return client
+}
+
+func startAndInitializeClient(t *testing.T, client *mcpclient.Client) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("client.Close failed: %v", err)
+		}
+	})
+	if err := client.Start(t.Context()); err != nil {
+		t.Fatalf("client.Start failed: %v", err)
+	}
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{
+		Name:    "test-client",
+		Version: "test",
+	}
+	if _, err := client.Initialize(t.Context(), initReq); err != nil {
+		t.Fatalf("client.Initialize failed: %v", err)
+	}
+}
+
+func toolResultText(result *mcp.CallToolResult) (string, error) {
+	var b strings.Builder
+	for _, content := range result.Content {
+		text, ok := content.(mcp.TextContent)
+		if !ok {
+			return "", fmt.Errorf("unsupported content type: %T", content)
+		}
+		b.WriteString(text.Text)
+	}
+	return b.String(), nil
+}
+
+func toolNames(tools map[string]*mcpserver.ServerTool) []string {
+	names := make([]string, 0, len(tools))
+	for name := range tools {
+		names = append(names, name)
+	}
+	return names
+}
+
+func hasTool(tools []mcp.Tool, name string) bool {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
 }
