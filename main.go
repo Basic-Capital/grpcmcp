@@ -192,12 +192,36 @@ func main() {
 	string64 := flag.Bool("string64", false, "Expose 64-bit protobuf integer fields as strings only in JSON schemas")
 	refreshInterval := flag.Duration("refresh-interval", 5*time.Minute, "How often to re-run reflection so new backend methods appear. Applies when reflect is set without descriptors.")
 	refreshTimeout := flag.Duration("refresh-timeout", time.Minute, "Time limit for one reflection refresh attempt")
+	clientCAFile := flag.String("client-ca-file", "", "PEM roots used to verify the backend certificate")
+	clientTLSCrt := flag.String("client-tls-crt", "", "Client certificate presented to the backend for mTLS")
+	clientTLSKey := flag.String("client-tls-key", "", "Key for the client certificate presented to the backend")
+	caFile := flag.String("ca-file", "", "PEM roots used to verify inbound client certificates. Requires every client to present one.")
+	tlsCrt := flag.String("tls-crt", "", "Certificate served by this server. Set with -tls-key to serve TLS.")
+	tlsKey := flag.String("tls-key", "", "Key for the certificate served by this server")
 
 	flag.Parse()
 
 	if *refreshInterval <= 0 {
 		fmt.Fprint(os.Stderr, "refresh-interval must be greater than 0.\n")
 		os.Exit(-1)
+	}
+	if (*tlsCrt == "") != (*tlsKey == "") {
+		fmt.Fprint(os.Stderr, "-tls-crt and -tls-key must be set together.\n")
+		os.Exit(-1)
+	}
+	if *caFile != "" && *tlsCrt == "" {
+		fmt.Fprint(os.Stderr, "-ca-file needs -tls-crt and -tls-key.\n")
+		os.Exit(-1)
+	}
+
+	tlsBackendClient, err := backendTLSClient(*clientCAFile, *clientTLSCrt, *clientTLSKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(-1)
+	}
+	if tlsBackendClient != nil && strings.HasPrefix(*baseURL, "http://") {
+		fmt.Fprint(os.Stderr, "Backend TLS options are ignored because -url is http://.\n")
+		tlsBackendClient = nil
 	}
 
 	var optFieldNum uint32
@@ -242,8 +266,11 @@ func main() {
 
 	// One client for the whole process. Every reflection call and every tool
 	// call shares its connection pool, so a repeated refresh does not open a new
-	// pool per tick.
-	backendClient := grpcmcp.DefaultHTTPClient(*baseURL)
+	// pool per tick. The TLS options build that client when they are set.
+	backendClient := tlsBackendClient
+	if backendClient == nil {
+		backendClient = grpcmcp.DefaultHTTPClient(*baseURL)
+	}
 
 	descriptorSet, err := loadDescriptors(ctx, *descriptors, *reflect, *baseURL, http.Header(headers), *useConnect, backendClient)
 	if err != nil {
@@ -334,13 +361,26 @@ func main() {
 		}
 	} else {
 		var err error
+		serveTLSRequested := *tlsCrt != ""
 		switch *transport {
 		case "http", "streamable-http":
 			httpSrv := server.NewStreamableHTTPServer(srv)
-			err = httpSrv.Start(*sseHostPort)
+			if serveTLSRequested {
+				// Match the routing that StreamableHTTPServer.Start sets up:
+				// the server is mounted at its endpoint path, not at every path.
+				mux := http.NewServeMux()
+				mux.Handle(streamableEndpointPath, httpSrv)
+				err = serveTLS(mux, *sseHostPort, *caFile, *tlsCrt, *tlsKey)
+			} else {
+				err = httpSrv.Start(*sseHostPort)
+			}
 		case "sse":
 			sseSrv := server.NewSSEServer(srv)
-			err = sseSrv.Start(*sseHostPort)
+			if serveTLSRequested {
+				err = serveTLS(sseSrv, *sseHostPort, *caFile, *tlsCrt, *tlsKey)
+			} else {
+				err = sseSrv.Start(*sseHostPort)
+			}
 		default:
 			err = fmt.Errorf("unknown transport %q: expected http, streamable-http, or sse", *transport)
 		}
