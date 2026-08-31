@@ -1,0 +1,21 @@
+tls_test.go
+  s_a90222c830938a::t_6c439879bb5277 115-149
+tls.go
+  s_a90222c830938a::t_3fad61ccc0a5e4 60-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "73815816e28843bc1e988601db20069dcdc1c036",
+  "prompts": {},
+  "sessions": {
+    "s_a90222c830938a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9a53e57-494b-4bde-8f8f-989ec8eb5a00",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Eric Butler <eric@basiccapital.com>"
+    }
+  }
+}
