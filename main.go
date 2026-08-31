@@ -182,7 +182,8 @@ func main() {
 	serverName := flag.String("name", "gRPC MCP Server", "Name of MCP Server")
 	serverVersion := flag.String("version", "1.0.0", "Version of MCP Server")
 	instructions := flag.String("instructions", "", "Natural-language guidance for the agent on what this server is for")
-	hostPort := flag.String("hostport", "", "host:port for the Streamable HTTP server. Without it the server uses stdio.")
+	hostPort := flag.String("hostport", "", "host:port for the HTTP server. Without it the server uses stdio.")
+	transport := flag.String("transport", "http", "Transport for the HTTP server, when -hostport is set: http (stateless Streamable HTTP) or sse (deprecated legacy transport, kept for clients that cannot yet speak Streamable HTTP)")
 	descriptors := flag.String("descriptors", "", "Location of the descriptor")
 	reflect := flag.Bool("reflect", false, "Use reflection to get descriptors")
 	services := flag.String("services", "", "If set, a comma separated list of services to expose")
@@ -203,9 +204,29 @@ func main() {
 
 	flag.Parse()
 
+	// -hostport alone selects HTTP vs stdio; -transport only matters once HTTP
+	// is in play. Computed here, before -transport is validated, so stdio
+	// invocations are never rejected over a flag that does nothing for them.
+	serveHTTP := *hostPort != ""
+
 	if *refreshInterval <= 0 {
 		fmt.Fprint(os.Stderr, "refresh-interval must be greater than 0.\n")
 		os.Exit(-1)
+	}
+	if serveHTTP {
+		// "streamable-http" is accepted alongside "http" for the same reason
+		// StreamableHTTPServer.Start uses it: an explicit, self-documenting
+		// spelling some callers already use.
+		if *transport == "streamable-http" {
+			*transport = "http"
+		}
+		if *transport != "http" && *transport != "sse" {
+			fmt.Fprintf(os.Stderr, "-transport must be http, streamable-http, or sse, got %q.\n", *transport)
+			os.Exit(-1)
+		}
+		if *transport == "sse" {
+			fmt.Fprint(os.Stderr, "[deprecated] -transport=sse selects the legacy SSE transport, removed from the MCP spec as of 2026-07-28. Prefer the default (Streamable HTTP); SSE support may be removed in a future release.\n")
+		}
 	}
 	if (*tlsCrt == "") != (*tlsKey == "") {
 		fmt.Fprint(os.Stderr, "-tls-crt and -tls-key must be set together.\n")
@@ -313,8 +334,11 @@ func main() {
 	// Only stdio can keep that promise. The HTTP server is stateless and serves
 	// no GET stream, so it holds no client to notify, and declaring the
 	// capability there would advertise something this server cannot deliver.
-	serveHTTP := *hostPort != ""
-	serverOptions := []server.ServerOption{server.WithToolCapabilities(!serveHTTP)}
+	useSSE := serveHTTP && *transport == "sse"
+	// listChanged needs a live stream to the client to deliver: true on stdio
+	// and legacy SSE, false on stateless Streamable HTTP, which holds no
+	// client to notify.
+	serverOptions := []server.ServerOption{server.WithToolCapabilities(!serveHTTP || useSSE)}
 	if *instructions != "" {
 		serverOptions = append(serverOptions, server.WithInstructions(*instructions))
 	}
@@ -382,6 +406,26 @@ func main() {
 		return
 	}
 
+	if useSSE {
+		// Legacy stateful transport, deprecated as of MCP 2026-07-28. Kept for
+		// clients that cannot yet speak Streamable HTTP.
+		//
+		// Wrapped in the same Origin check as Streamable HTTP: the DNS-rebinding
+		// protection it exists for applies to this transport too, and using
+		// sseSrv.Start directly would silently skip it.
+		sseSrv := server.NewSSEServer(srv, server.WithSSEDisableLocalhostProtection(true))
+		handler := rejectBrowserOrigin(sseSrv)
+		if *tlsCrt != "" {
+			err = serveTLS(handler, *hostPort, *caFile, *tlsCrt, *tlsKey)
+		} else {
+			err = (&http.Server{Addr: *hostPort, Handler: handler}).ListenAndServe()
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		}
+		return
+	}
+
 	// Stateless, with no GET stream. Every tool call is an independent unary gRPC
 	// request, so this server keeps nothing between requests: any replica can
 	// serve any request, and a restart costs a client nothing.
@@ -393,6 +437,12 @@ func main() {
 	httpSrv := server.NewStreamableHTTPServer(srv,
 		server.WithStateLess(true),
 		server.WithDisableStreaming(true),
+		// mcp-go's own DNS-rebinding guard only fires for loopback connections
+		// (e.g. kubectl port-forward through a Host-header-preserving local
+		// proxy) and would 403 those spuriously. rejectBrowserOrigin below
+		// already covers DNS rebinding for every connection, loopback or not,
+		// so this server doesn't need the redundant, narrower check too.
+		server.WithDisableLocalhostProtection(true),
 	)
 	// Mount at the endpoint path rather than at every path, matching the routing
 	// that StreamableHTTPServer.Start sets up.

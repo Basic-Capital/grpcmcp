@@ -20,10 +20,11 @@ A simple MCP server that will proxy to a grpc backend based on a provided descri
 
 ## Transports
 
-grpcmcp serves one of two transports, chosen by `hostport`:
+grpcmcp serves one of three transports, chosen by `hostport` and `transport`:
 
 * Without `hostport`, it serves **stdio**.
-* With `hostport`, it serves **Streamable HTTP** at `/mcp`.
+* With `hostport`, it serves **Streamable HTTP** at `/mcp` (default, `transport=http`).
+* With `hostport` and `transport=sse`, it serves the legacy, stateful **SSE** transport instead. This is deprecated as of MCP 2026-07-28 and kept only for clients that cannot yet speak Streamable HTTP; prefer the default.
 
 The HTTP server is stateless. It mints no session, it ignores an inbound
 `Mcp-Session-Id`, and it answers `GET /mcp` with 405, because it opens no
@@ -46,13 +47,12 @@ not implement, and the error body names the versions it does support. A request
 that omits the header is accepted and read as `2025-03-26`, which the spec
 allows for clients older than `2025-06-18`.
 
-The deprecated HTTP+SSE transport from MCP 2024-11-05 is not served.
-
 ## Options / Features
 
 `grpcmcp --help` for a full list of options.
 
-* `hostport` string - When set, serve Streamable HTTP at `/mcp` on this host:port. Without it, serve stdio.
+* `hostport` string - When set, serve HTTP on this host:port. Without it, serve stdio.
+* `transport` string - Which HTTP transport to serve when `hostport` is set: `http` (default, stateless Streamable HTTP at `/mcp`) or `sse` (deprecated legacy transport, kept for clients that cannot yet speak Streamable HTTP).
 
 * `instructions` string - Natural-language guidance for the agent on what this server is for. Sent to the client during initialization.
 

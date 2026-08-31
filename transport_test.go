@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -38,10 +39,43 @@ func newTestHTTPServer(t *testing.T) http.Handler {
 	httpSrv := server.NewStreamableHTTPServer(srv,
 		server.WithStateLess(true),
 		server.WithDisableStreaming(true),
+		server.WithDisableLocalhostProtection(true),
 	)
 	mux := http.NewServeMux()
 	mux.Handle(streamableEndpointPath, rejectBrowserOrigin(rejectUnsupportedProtocolVersion(httpSrv)))
 	return mux
+}
+
+// loopbackAddr satisfies net.Addr as a stand-in for the real one httptest
+// does not populate, so tests can simulate a request that arrived on a
+// loopback connection.
+type loopbackAddr struct{}
+
+func (loopbackAddr) Network() string { return "tcp" }
+func (loopbackAddr) String() string  { return "127.0.0.1:8080" }
+
+// TestLoopbackConnectionForeignHostAccepted checks that a request arriving on
+// a loopback connection (e.g. kubectl port-forward) with a non-loopback Host
+// header (e.g. a local proxy that preserves the external hostname) is not
+// rejected. mcp-go's own DNS-rebinding guard would 403 this by default;
+// WithDisableLocalhostProtection turns it off because rejectBrowserOrigin
+// already covers DNS rebinding for every connection, not just loopback ones.
+func TestLoopbackConnectionForeignHostAccepted(t *testing.T) {
+	h := newTestHTTPServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, streamableEndpointPath, strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Host = "mcp.basiccapital.dev"
+	req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, loopbackAddr{}))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (got body: %s)", rec.Code, rec.Body.String())
+	}
 }
 
 // post sends one JSON-RPC message to /mcp and returns the response.
@@ -55,7 +89,9 @@ func post(t *testing.T, h http.Handler, body string, header http.Header) *http.R
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	return rec.Result()
+	resp := rec.Result()
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
 }
 
 // assertJSONRPCErrorIDNull checks that an error response includes "id": null,
@@ -259,5 +295,55 @@ func TestHTTPDoesNotDeclareListChanged(t *testing.T) {
 	}
 	if listChanged, found := tools["listChanged"]; found && listChanged == true {
 		t.Error("capabilities.tools.listChanged = true, want false or absent on stateless HTTP")
+	}
+}
+
+// TestSSEStillServes checks that -transport=sse still starts a working legacy
+// transport, deprecated but not removed: a GET opens an event stream, which
+// stateless Streamable HTTP (TestGETNotAllowed) rejects with 405.
+func TestSSEStillServes(t *testing.T) {
+	fds := &descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{
+			buildEmptyFileDescriptor(),
+			buildFileDescriptor("com.example.wallet", "WalletService", []string{"GetPlan"}),
+		},
+	}
+	tools, err := grpcmcp.Tools(grpcmcp.Config{
+		Descriptors: fds,
+		BaseURL:     "http://localhost:0",
+		ToolName:    buildToolNamer(fds, nil, nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.NewMCPServer("test", "1.0.0", server.WithToolCapabilities(true))
+	srv.AddTools(tools...)
+	sseSrv := server.NewSSEServer(srv)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sse", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel() // the SSE stream never ends on its own; a canceled request does.
+	sseSrv.ServeHTTP(rr, req.WithContext(ctx))
+
+	if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+}
+
+// TestSSERejectsOrigin checks that the SSE transport gets the same
+// DNS-rebinding protection as Streamable HTTP, rather than skipping it because
+// sseSrv.Start bypasses the wrapper.
+func TestSSERejectsOrigin(t *testing.T) {
+	srv := server.NewMCPServer("test", "1.0.0")
+	handler := rejectBrowserOrigin(server.NewSSEServer(srv))
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sse", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rr.Code)
 	}
 }
