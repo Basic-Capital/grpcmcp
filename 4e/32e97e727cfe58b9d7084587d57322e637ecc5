@@ -1,0 +1,28 @@
+README.md
+  s_96dd33ab2668b5::t_d2f7329446e4d8 23,26-27
+  s_96dd33ab2668b5::t_24a01f9433660e 54-55
+main.go
+  s_96dd33ab2668b5::t_05202737c08bf2 185-186
+  s_96dd33ab2668b5::t_2fe5823f77fc39 397-411
+  s_96dd33ab2668b5::t_1de17cd931b05f 325-329
+  s_96dd33ab2668b5::t_c441a642e7b019 211-217
+transport_test.go
+  s_96dd33ab2668b5::t_85dd6a9306304a 4
+  s_96dd33ab2668b5::t_d2c23084ccf365 265-297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4e32e97e727cfe58b9d7084587d57322e637ecc5",
+  "prompts": {},
+  "sessions": {
+    "s_96dd33ab2668b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe57692f-d675-458a-92b9-61b8260b1c49",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Daniel Bak <daniel.bak@basiccapital.com>"
+    }
+  }
+}
