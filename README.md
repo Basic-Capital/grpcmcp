@@ -72,6 +72,8 @@ allows for clients older than `2025-06-18`.
 
 * `forward-operator-identity` - Copy the `X-Operator-Identity` header from inbound MCP requests onto outbound gRPC calls, so the backend can attribute agent calls to the human operator. The header is read per request, so it identifies the caller of that tool call. It must be minted by a trusted proxy in front of this server; grpcmcp does not verify it. This needs `hostport`, because stdio carries no HTTP headers.
 
+* `forward-header` string - Copy a named header from inbound MCP requests onto outbound gRPC calls, if present. Repeatable (e.g. `--forward-header=X-Forwarded-User --forward-header=X-Forwarded-Access-Token`). Same trust model as `forward-operator-identity` -- the header must be minted by a trusted proxy in front of this server, and grpcmcp does not verify it -- generalized to whatever header name that proxy actually uses instead of `X-Operator-Identity` specifically. This needs `hostport`, for the same reason as above.
+
 * `string64` - If set, expose 64-bit protobuf integer fields (`int64`, `uint64`, `sint64`, `fixed64`, `sfixed64`) as strings only in MCP JSON schemas. This avoids precision ambiguity for JavaScript-based clients and agents. By default, schemas continue to allow either JSON numbers or strings for compatibility.
 
 * `refresh-interval` duration - How often to re-run reflection so methods added to the backend appear without a restart. Defaults to `5m`. This applies when `reflect` is set and `descriptors` is not: a descriptor file wins over reflection for the initial load, so a refresh from reflection would replace the set the operator asked for.
