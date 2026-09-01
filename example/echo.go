@@ -110,7 +110,14 @@ func echoHandler(method protoreflect.MethodDescriptor) http.HandlerFunc {
 		}
 
 		resp := dynamicpb.NewMessage(outputDesc)
-		resp.Set(outMessageField, req.Get(messageField))
+		message := req.Get(messageField).String()
+		// Surface a forwarded header in the response, if present, so a test
+		// can confirm grpcmcp actually forwarded it -- not just that grpcmcp's
+		// own code constructed the header, but that it arrived at the backend.
+		if forwardedUser := r.Header.Get("X-Forwarded-User"); forwardedUser != "" {
+			message += "|" + forwardedUser
+		}
+		resp.Set(outMessageField, protoreflect.ValueOfString(message))
 
 		respBytes, err := proto.Marshal(resp)
 		if err != nil {
