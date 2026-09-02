@@ -1,0 +1,19 @@
+main.go
+  s_96dd33ab2668b5::t_1c311a2e4600e6 413-415,417
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e7d245eb55b9842f7e18e924048b9a334043b7d7",
+  "prompts": {},
+  "sessions": {
+    "s_96dd33ab2668b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe57692f-d675-458a-92b9-61b8260b1c49",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Daniel Bak <daniel.bak@basiccapital.com>"
+    }
+  }
+}
