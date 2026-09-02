@@ -1,0 +1,45 @@
+example/echo.go
+  s_96dd33ab2668b5::t_fef4d20f4c4bae 1-20,27-95,100-112,121-136
+  s_96dd33ab2668b5::t_883318854a68b3 96-99
+  s_96dd33ab2668b5::t_66c6b1472cf43e 21-26
+  s_96dd33ab2668b5::t_1742f5b6853463 113-120
+scripts/e2e_test.sh
+  s_96dd33ab2668b5::t_385fecd6ebd6bc 77-86
+  s_96dd33ab2668b5::t_e86955eefb7120 76
+  s_96dd33ab2668b5::t_48a38e256c5d70 64
+  s_96dd33ab2668b5::t_91632b960ca5b8 1-21,32-51,57-59,61-63,65-75,87-98,118-140
+  s_96dd33ab2668b5::t_81fd00135485a6 52-56,60
+  s_96dd33ab2668b5::t_97edae10956dfe 99-117
+  s_96dd33ab2668b5::t_88ee57fcc24f97 31
+.github/workflows/ci.yaml
+  s_96dd33ab2668b5::t_5e313a3b5163ed 34-35
+example/echo_test.go
+  s_96dd33ab2668b5::t_6964efd7464589 7,15-21,24
+  s_96dd33ab2668b5::t_5d2885928fde50 1-6,8-14,22-23,25-81
+example/main.go
+  s_96dd33ab2668b5::t_dfb669b7bc1c84 15,19-23
+README.md
+  s_96dd33ab2668b5::t_a0eb80e91b7a7f 75-76
+main.go
+  s_96dd33ab2668b5::t_5177e1460ab83e 360-362
+  s_96dd33ab2668b5::t_c670a8aa280158 47-69
+  s_96dd33ab2668b5::t_48739618f774b8 218-222
+forward_header_test.go
+  s_96dd33ab2668b5::t_920bbc0a8ee78d 1-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2fda83ac6ab5dc3da0adf0194b8d4ad8d77107c6",
+  "prompts": {},
+  "sessions": {
+    "s_96dd33ab2668b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe57692f-d675-458a-92b9-61b8260b1c49",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": null
+    }
+  }
+}
