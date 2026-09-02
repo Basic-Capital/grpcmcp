@@ -410,11 +410,11 @@ func main() {
 		// Legacy stateful transport, deprecated as of MCP 2026-07-28. Kept for
 		// clients that cannot yet speak Streamable HTTP.
 		//
-		// Wrapped in the same Origin check as Streamable HTTP: the DNS-rebinding
-		// protection it exists for applies to this transport too, and using
-		// sseSrv.Start directly would silently skip it.
+		// Wrapped in the same Origin and protocol-version checks as Streamable
+		// HTTP: both protections apply to this transport too, and using
+		// sseSrv.Start directly would silently skip them.
 		sseSrv := server.NewSSEServer(srv, server.WithSSEDisableLocalhostProtection(true))
-		handler := rejectBrowserOrigin(sseSrv)
+		handler := rejectBrowserOrigin(rejectUnsupportedProtocolVersion(sseSrv))
 		if *tlsCrt != "" {
 			err = serveTLS(handler, *hostPort, *caFile, *tlsCrt, *tlsKey)
 		} else {
