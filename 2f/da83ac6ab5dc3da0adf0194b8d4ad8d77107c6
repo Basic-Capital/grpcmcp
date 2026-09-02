@@ -11,6 +11,7 @@ scripts/e2e_test.sh
   s_96dd33ab2668b5::t_81fd00135485a6 52-56,60
   s_96dd33ab2668b5::t_97edae10956dfe 99-117
   s_96dd33ab2668b5::t_88ee57fcc24f97 31
+  s_96dd33ab2668b5::t_7ebeca34c8d7ca 30
 .github/workflows/ci.yaml
   s_96dd33ab2668b5::t_5e313a3b5163ed 34-35
 example/echo_test.go
