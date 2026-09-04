@@ -3,8 +3,10 @@ package main
 import (
 	"testing"
 
+	"github.com/Basic-Capital/grpcmcp/grpcmcp"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -290,6 +292,178 @@ func TestHasMethodOptionMultiValue(t *testing.T) {
 			got := hasMethodOption(method, 50003, tt.expectedValues)
 			if got != tt.want {
 				t.Errorf("hasMethodOption() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func methodWithStringOption(fieldNum uint32, value string) protoreflect.MethodDescriptor {
+	var buf []byte
+	buf = protowire.AppendTag(buf, protowire.Number(fieldNum), protowire.BytesType)
+	buf = protowire.AppendString(buf, value)
+
+	opts := &descriptorpb.MethodOptions{}
+	opts.ProtoReflect().SetUnknown(protoreflect.RawFields(buf))
+
+	fd := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String("test_string_option.proto"),
+		Package:    proto.String("test"),
+		Syntax:     proto.String("proto3"),
+		Dependency: []string{"google/protobuf/empty.proto"},
+		Service: []*descriptorpb.ServiceDescriptorProto{
+			{
+				Name: proto.String("TestStringOptionService"),
+				Method: []*descriptorpb.MethodDescriptorProto{
+					{
+						Name:       proto.String("TestStringOptionMethod"),
+						InputType:  proto.String(".google.protobuf.Empty"),
+						OutputType: proto.String(".google.protobuf.Empty"),
+						Options:    opts,
+					},
+				},
+			},
+		},
+	}
+	files, err := protodesc.NewFiles(&descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{
+			protodesc.ToFileDescriptorProto(emptypb.File_google_protobuf_empty_proto),
+			fd,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	d, err := files.FindDescriptorByName("test.TestStringOptionService.TestStringOptionMethod")
+	if err != nil {
+		panic(err)
+	}
+	return d.(protoreflect.MethodDescriptor)
+}
+
+func TestGetMethodOptionString(t *testing.T) {
+	t.Run("returns the string option value", func(t *testing.T) {
+		m := methodWithStringOption(50005, "Returns the plan for a UUID.")
+		if got := getMethodOptionString(m, 50005); got != "Returns the plan for a UUID." {
+			t.Fatalf("got %q", got)
+		}
+	})
+	t.Run("returns empty for a different field number", func(t *testing.T) {
+		m := methodWithStringOption(50005, "x")
+		if got := getMethodOptionString(m, 50006); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+	t.Run("returns empty when the field is a varint, not a string", func(t *testing.T) {
+		m := methodWithVarintOption(50003, 1)
+		if got := getMethodOptionString(m, 50003); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+	t.Run("returns empty when the option is absent", func(t *testing.T) {
+		m := methodWithVarintOption(50003, 1)
+		if got := getMethodOptionString(m, 50005); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+}
+
+func TestGetMethodOptionStringUTF8(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "empty"},
+		{name: "multibyte text", value: "Café 世界 🌍", want: "Café 世界 🌍"},
+		{name: "invalid byte", value: "description\xff"},
+		{name: "truncated sequence", value: "description\xe2\x82"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := methodWithStringOption(50005, tc.value)
+			if got := getMethodOptionString(m, 50005); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestToolsUseMethodDescriptionOption(t *testing.T) {
+	m := methodWithStringOption(50005, "Returns the plan for a UUID.")
+	fds := &descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{
+			protodesc.ToFileDescriptorProto(emptypb.File_google_protobuf_empty_proto),
+			protodesc.ToFileDescriptorProto(m.ParentFile()),
+		},
+	}
+	tools, err := grpcmcp.Tools(grpcmcp.Config{
+		Descriptors: fds,
+		BaseURL:     "http://127.0.0.1:1",
+		MethodDescription: func(md protoreflect.MethodDescriptor) string {
+			return getMethodOptionString(md, 50005)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("got %d tools, want 1", len(tools))
+	}
+	if got := tools[0].Tool.Description; got != "Returns the plan for a UUID." {
+		t.Fatalf("description = %q", got)
+	}
+}
+
+func TestMethodOptionLookupSkipsFields(t *testing.T) {
+	var unrelated []byte
+	unrelated = protowire.AppendTag(unrelated, 50001, protowire.VarintType)
+	unrelated = protowire.AppendVarint(unrelated, 42)
+	unrelated = protowire.AppendTag(unrelated, 50002, protowire.Fixed32Type)
+	unrelated = protowire.AppendFixed32(unrelated, 42)
+	unrelated = protowire.AppendTag(unrelated, 50003, protowire.Fixed64Type)
+	unrelated = protowire.AppendFixed64(unrelated, 42)
+	unrelated = protowire.AppendTag(unrelated, 50004, protowire.BytesType)
+	unrelated = protowire.AppendString(unrelated, "unrelated")
+	unrelated = protowire.AppendTag(unrelated, 50006, protowire.StartGroupType)
+	group := protowire.AppendTag(nil, 1, protowire.VarintType)
+	group = protowire.AppendVarint(group, 42)
+	unrelated = protowire.AppendGroup(unrelated, 50006, group)
+
+	malformed := protowire.AppendTag(nil, 50004, protowire.BytesType)
+	malformed = protowire.AppendVarint(malformed, 1000) // Length exceeds available bytes.
+
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+		suffix []byte
+		found  bool
+	}{
+		{name: "all wire types before match", prefix: unrelated, found: true},
+		{name: "malformed field before match", prefix: malformed},
+		{name: "malformed tag before match", prefix: []byte{0}},
+		{name: "stop before malformed suffix", prefix: unrelated, suffix: malformed, found: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, stringOption := range []bool{false, true} {
+				m := methodWithVarintOption(50005, 7)
+				if stringOption {
+					m = methodWithStringOption(50005, "description")
+				}
+				opts := m.Options().ProtoReflect()
+				wire := append([]byte(nil), tc.prefix...)
+				wire = append(wire, opts.GetUnknown()...)
+				wire = append(wire, tc.suffix...)
+				opts.SetUnknown(wire)
+				if stringOption {
+					want := ""
+					if tc.found {
+						want = "description"
+					}
+					if got := getMethodOptionString(m, 50005); got != want {
+						t.Fatalf("string option = %q, want %q", got, want)
+					}
+				} else if got := hasMethodOption(m, 50005, []uint64{7}); got != tc.found {
+					t.Fatalf("varint option found = %v, want %v", got, tc.found)
+				}
 			}
 		})
 	}
