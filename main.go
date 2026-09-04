@@ -44,6 +44,29 @@ func operatorIdentityHeaders(base grpcmcp.ToolHeaderProvider) grpcmcp.ToolHeader
 	}
 }
 
+// forwardHeaders wraps base to copy each named header from the inbound MCP
+// request onto the outbound gRPC call, if present. Like operatorIdentityHeaders,
+// this trusts whatever minted the header -- grpcmcp does not verify it -- so
+// it is only as safe as the proxy in front of this server. Unlike
+// operatorIdentityHeaders, the header name is not fixed: this is the general
+// mechanism for a reverse proxy (e.g. an OAuth-terminating proxy) that
+// authenticates the caller and asserts identity via its own header names
+// (e.g. X-Forwarded-User) rather than X-Operator-Identity specifically.
+func forwardHeaders(base grpcmcp.ToolHeaderProvider, names []string) grpcmcp.ToolHeaderProvider {
+	return func(ctx context.Context, req mcp.CallToolRequest) (http.Header, error) {
+		h, err := base(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range names {
+			if v := req.Header.Get(name); v != "" {
+				h.Set(name, v)
+			}
+		}
+		return h, nil
+	}
+}
+
 type headerFlags http.Header
 
 func (s *headerFlags) String() string {
@@ -192,6 +215,11 @@ func main() {
 	useConnect := flag.Bool("connect", false, "Use connect protocol (instead of gRPC)")
 	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value or fieldNumber:value1,value2, e.g. 50003:1 or 50003:1,2)")
 	forwardOperatorIdentity := flag.Bool("forward-operator-identity", false, "Copy the X-Operator-Identity header from inbound MCP requests onto outbound gRPC calls. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.")
+	var forwardHeaderNames []string
+	flag.Func("forward-header", "Copy a named header from inbound MCP requests onto outbound gRPC calls, if present. Repeatable. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.", func(v string) error {
+		forwardHeaderNames = append(forwardHeaderNames, v)
+		return nil
+	})
 	string64 := flag.Bool("string64", false, "Expose 64-bit protobuf integer fields as strings only in JSON schemas")
 	refreshInterval := flag.Duration("refresh-interval", 5*time.Minute, "How often to re-run reflection so new backend methods appear. Applies when reflect is set without descriptors.")
 	refreshTimeout := flag.Duration("refresh-timeout", time.Minute, "Time limit for one reflection refresh attempt")
@@ -243,6 +271,14 @@ func main() {
 		fmt.Fprint(os.Stderr, "-tls-crt, -tls-key, and -ca-file need -hostport. Without it the server uses stdio, which has no TLS.\n")
 		os.Exit(-1)
 	}
+	// Same reasoning: stdio has no inbound HTTP headers to forward, so these
+	// flags would silently do nothing rather than forward anything, which is
+	// worse than an error for something an operator is relying on for identity
+	// attribution.
+	if (*forwardOperatorIdentity || len(forwardHeaderNames) > 0) && !serveHTTP {
+		fmt.Fprint(os.Stderr, "-forward-operator-identity and -forward-header need -hostport. Without it the server uses stdio, which has no HTTP headers to forward.\n")
+		os.Exit(-1)
+	}
 
 	tlsBackendClient, err := backendTLSClient(*clientCAFile, *clientTLSCrt, *clientTLSKey)
 	if err != nil {
@@ -289,6 +325,23 @@ func main() {
 		}
 	}
 
+	// forwardHeaders and operatorIdentityHeaders overwrite whatever base already
+	// set for that header name (see forwardHeaders' doc comment). If a forwarded
+	// name collides with one set here from -header or -bearer-env -- most
+	// dangerously Authorization -- an inbound MCP client would silently replace
+	// grpcmcp's own trusted backend credential on every call. Reject that
+	// configuration outright rather than let it happen quietly.
+	for _, name := range forwardHeaderNames {
+		if http.Header(headers).Get(name) != "" {
+			fmt.Fprintf(os.Stderr, "-forward-header=%q collides with a header already set via -header or -bearer-env; refusing to let an inbound client override it.\n", name)
+			os.Exit(-1)
+		}
+	}
+	if *forwardOperatorIdentity && http.Header(headers).Get(operatorIdentityHeader) != "" {
+		fmt.Fprintf(os.Stderr, "-forward-operator-identity collides with a -header value already set for %s; refusing to let an inbound client override it.\n", operatorIdentityHeader)
+		os.Exit(-1)
+	}
+
 	ctx := context.Background()
 
 	if *descriptors == "" && !*reflect {
@@ -328,6 +381,9 @@ func main() {
 	headersProvider := grpcmcp.StaticHeaders(http.Header(headers))
 	if *forwardOperatorIdentity {
 		headersProvider = operatorIdentityHeaders(headersProvider)
+	}
+	if len(forwardHeaderNames) > 0 {
+		headersProvider = forwardHeaders(headersProvider, forwardHeaderNames)
 	}
 
 	// listChanged promises the client a notification when the tool set changes.
