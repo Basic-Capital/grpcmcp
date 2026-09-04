@@ -3,8 +3,10 @@ package main
 import (
 	"testing"
 
+	"github.com/Basic-Capital/grpcmcp/grpcmcp"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -294,5 +296,101 @@ func TestHasMethodOptionMultiValue(t *testing.T) {
 				t.Errorf("hasMethodOption() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func methodWithStringOption(fieldNum uint32, value string) protoreflect.MethodDescriptor {
+	var buf []byte
+	buf = protowire.AppendTag(buf, protowire.Number(fieldNum), protowire.BytesType)
+	buf = protowire.AppendString(buf, value)
+
+	opts := &descriptorpb.MethodOptions{}
+	opts.ProtoReflect().SetUnknown(protoreflect.RawFields(buf))
+
+	fd := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String("test_string_option.proto"),
+		Package:    proto.String("test"),
+		Syntax:     proto.String("proto3"),
+		Dependency: []string{"google/protobuf/empty.proto"},
+		Service: []*descriptorpb.ServiceDescriptorProto{
+			{
+				Name: proto.String("TestStringOptionService"),
+				Method: []*descriptorpb.MethodDescriptorProto{
+					{
+						Name:       proto.String("TestStringOptionMethod"),
+						InputType:  proto.String(".google.protobuf.Empty"),
+						OutputType: proto.String(".google.protobuf.Empty"),
+						Options:    opts,
+					},
+				},
+			},
+		},
+	}
+	files, err := protodesc.NewFiles(&descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{
+			protodesc.ToFileDescriptorProto(emptypb.File_google_protobuf_empty_proto),
+			fd,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	d, err := files.FindDescriptorByName("test.TestStringOptionService.TestStringOptionMethod")
+	if err != nil {
+		panic(err)
+	}
+	return d.(protoreflect.MethodDescriptor)
+}
+
+func TestGetMethodOptionString(t *testing.T) {
+	t.Run("returns the string option value", func(t *testing.T) {
+		m := methodWithStringOption(50005, "Returns the plan for a UUID.")
+		if got := getMethodOptionString(m, 50005); got != "Returns the plan for a UUID." {
+			t.Fatalf("got %q", got)
+		}
+	})
+	t.Run("returns empty for a different field number", func(t *testing.T) {
+		m := methodWithStringOption(50005, "x")
+		if got := getMethodOptionString(m, 50006); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+	t.Run("returns empty when the field is a varint, not a string", func(t *testing.T) {
+		m := methodWithVarintOption(50003, 1)
+		if got := getMethodOptionString(m, 50003); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+	t.Run("returns empty when the option is absent", func(t *testing.T) {
+		m := methodWithVarintOption(50003, 1)
+		if got := getMethodOptionString(m, 50005); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+}
+
+func TestToolsUseMethodDescriptionOption(t *testing.T) {
+	m := methodWithStringOption(50005, "Returns the plan for a UUID.")
+	fds := &descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{
+			protodesc.ToFileDescriptorProto(emptypb.File_google_protobuf_empty_proto),
+			protodesc.ToFileDescriptorProto(m.ParentFile()),
+		},
+	}
+	tools, err := grpcmcp.Tools(grpcmcp.Config{
+		Descriptors: fds,
+		BaseURL:     "http://127.0.0.1:1",
+		MethodDescription: func(md protoreflect.MethodDescriptor) string {
+			return getMethodOptionString(md, 50005)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("got %d tools, want 1", len(tools))
+	}
+	if got := tools[0].Tool.Description; got != "Returns the plan for a UUID." {
+		t.Fatalf("description = %q", got)
 	}
 }

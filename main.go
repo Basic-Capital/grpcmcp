@@ -171,6 +171,55 @@ func hasMethodOption(m protoreflect.MethodDescriptor, fieldNum uint32, expectedV
 	return false
 }
 
+// getMethodOptionString returns the value of the string-typed custom method
+// option with the given field number, or "" when the option is absent or not a
+// length-delimited field. Custom options set by another language's protoc
+// output arrive here as unknown fields, so the marshalled options are scanned
+// directly rather than via a registered extension type.
+func getMethodOptionString(m protoreflect.MethodDescriptor, fieldNum uint32) string {
+	opts := m.Options()
+	if opts == nil {
+		return ""
+	}
+	b, err := proto.Marshal(opts)
+	if err != nil {
+		return ""
+	}
+	for len(b) > 0 {
+		num, wtype, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return ""
+		}
+		b = b[n:]
+		if uint32(num) == fieldNum && wtype == protowire.BytesType {
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return ""
+			}
+			return string(v)
+		}
+		switch wtype {
+		case protowire.VarintType:
+			_, n = protowire.ConsumeVarint(b)
+		case protowire.Fixed32Type:
+			_, n = protowire.ConsumeFixed32(b)
+		case protowire.Fixed64Type:
+			_, n = protowire.ConsumeFixed64(b)
+		case protowire.BytesType:
+			_, n = protowire.ConsumeBytes(b)
+		case protowire.StartGroupType:
+			_, n = protowire.ConsumeGroup(protowire.Number(num), b)
+		default:
+			return ""
+		}
+		if n < 0 {
+			return ""
+		}
+		b = b[n:]
+	}
+	return ""
+}
+
 func main() {
 	headers := make(headerFlags)
 	flag.Var(&headers, "header", "Headers to add to the backend request (Header: Value). Can apply multiple times.")
@@ -186,6 +235,7 @@ func main() {
 	baseURL := flag.String("url", "http://localhost:8090", "The url of the backend")
 	useConnect := flag.Bool("connect", false, "Use connect protocol (instead of gRPC)")
 	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value or fieldNumber:value1,value2, e.g. 50003:1 or 50003:1,2)")
+	descriptionMethodOption := flag.Uint("description-method-option", 0, "Field number of a string-typed custom method option whose value is used as the MCP tool description (e.g. 50005). Useful when the backend's reflected descriptors carry no source comments.")
 	shortNames := flag.Bool("short-names", false, "Use short tool names (ServiceName__MethodName instead of full package path). Saves tokens when used with LLM agents that list all tool names in context.")
 	veryShortNames := flag.Bool("very-short-names", false, "Use very short tool names (MethodName only, no service prefix). Falls back to ServiceName__MethodName if method names collide across services, and to full path if service names also collide.")
 	forwardOperatorIdentity := flag.Bool("forward-operator-identity", false, "Copy the X-Operator-Identity header from inbound MCP requests onto outbound gRPC calls. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.")
@@ -299,24 +349,33 @@ func main() {
 
 	toolName := buildToolNamer(descriptorSet, servicesMap, methodFilter, *shortNames, *veryShortNames)
 
+	var methodDescription func(protoreflect.MethodDescriptor) string
+	if *descriptionMethodOption > 0 {
+		descFieldNum := uint32(*descriptionMethodOption)
+		methodDescription = func(m protoreflect.MethodDescriptor) string {
+			return getMethodOptionString(m, descFieldNum)
+		}
+	}
+
 	headersProvider := grpcmcp.StaticHeaders(http.Header(headers))
 	if *forwardOperatorIdentity {
 		headersProvider = operatorIdentityHeaders(headersProvider)
 	}
 
 	cfg := grpcmcp.Config{
-		Headers:       headersProvider,
-		ServerName:    *serverName,
-		Version:       *serverVersion,
-		Descriptors:   descriptorSet,
-		Services:      serviceNames,
-		BaseURL:       *baseURL,
-		HTTPClient:    backendClient,
-		UseConnect:    *useConnect,
-		String64:      *string64,
-		MethodFilter:  methodFilter,
-		ToolName:      toolName,
-		ServerOptions: []server.ServerOption{server.WithToolCapabilities(true)},
+		Headers:           headersProvider,
+		ServerName:        *serverName,
+		Version:           *serverVersion,
+		Descriptors:       descriptorSet,
+		Services:          serviceNames,
+		BaseURL:           *baseURL,
+		HTTPClient:        backendClient,
+		UseConnect:        *useConnect,
+		String64:          *string64,
+		MethodFilter:      methodFilter,
+		ToolName:          toolName,
+		MethodDescription: methodDescription,
+		ServerOptions:     []server.ServerOption{server.WithToolCapabilities(true)},
 	}
 	srv, err := grpcmcp.NewServer(cfg)
 	if err != nil {
