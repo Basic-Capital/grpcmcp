@@ -27,7 +27,8 @@ WORKDIR=$(mktemp -d)
 BACKEND_PID=
 HTTP_PID=
 SSE_PID=
-trap 'kill $BACKEND_PID $HTTP_PID $SSE_PID 2>/dev/null; wait 2>/dev/null; rm -rf "$WORKDIR"' EXIT
+FWD_PID=
+trap 'kill $BACKEND_PID $HTTP_PID $SSE_PID $FWD_PID 2>/dev/null; wait 2>/dev/null; rm -rf "$WORKDIR"' EXIT
 
 echo "== building =="
 go build -o "$WORKDIR/grpcmcp" . || exit 1
@@ -48,9 +49,15 @@ echo "== starting grpcmcp --transport=sse (:8092) =="
 SSE_PID=$!
 sleep 0.5
 
+echo "== starting grpcmcp --forward-header=X-Forwarded-User (:8093) =="
+"$WORKDIR/grpcmcp" --hostport=localhost:8093 --reflect --transport=http --forward-header=X-Forwarded-User >"$WORKDIR/fwd.log" 2>&1 &
+FWD_PID=$!
+sleep 0.5
+
 if ! kill -0 "$BACKEND_PID" 2>/dev/null; then echo "backend failed to start"; cat "$WORKDIR"/*.log; exit 1; fi
 if ! kill -0 "$HTTP_PID" 2>/dev/null; then echo "http server failed to start"; cat "$WORKDIR/http.log"; exit 1; fi
 if ! kill -0 "$SSE_PID" 2>/dev/null; then echo "sse server failed to start"; cat "$WORKDIR/sse.log"; exit 1; fi
+if ! kill -0 "$FWD_PID" 2>/dev/null; then echo "forward-header server failed to start"; cat "$WORKDIR/fwd.log"; exit 1; fi
 
 INIT_BODY='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"1"}}}'
 LIST_BODY='{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
@@ -89,6 +96,25 @@ status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8091/mc
 check "POST /mcp with bogus Mcp-Protocol-Version -> 400" "$status" "400"
 
 echo
+echo
+echo "== --forward-header=X-Forwarded-User (:8093) =="
+
+curl -s -X POST http://localhost:8093/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d "$INIT_BODY" > /dev/null
+
+fwd_result=$(curl -s -X POST http://localhost:8093/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H 'X-Forwarded-User: alice@basiccapital.com' \
+  -d "$CALL_BODY")
+if echo "$fwd_result" | grep -q 'hello-e2e|alice@basiccapital.com'; then
+  echo "  ok   - X-Forwarded-User reached the backend over a real gRPC call"
+  PASS=$((PASS+1))
+else
+  echo "  FAIL - X-Forwarded-User did not reach the backend: $fwd_result"
+  FAIL=$((FAIL+1))
+fi
+
 echo "== SSE (:8092, deprecated) =="
 
 if grep -q '\[deprecated\].*transport=sse' "$WORKDIR/sse.log"; then
