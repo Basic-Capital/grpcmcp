@@ -48,6 +48,11 @@ type Config struct {
 	// ToolName, when set, overrides the default tool naming
 	// (full service name + "__" + method name, dots replaced).
 	ToolName func(protoreflect.ServiceDescriptor, protoreflect.MethodDescriptor) string
+	// MethodDescription, when set, supplies an extra tool description for a
+	// method (for example from a custom method option). A non-empty result is
+	// placed before any descriptor source comments, which are usually absent
+	// from descriptors served over reflection by Java backends.
+	MethodDescription func(protoreflect.MethodDescriptor) string
 	// ServerOptions are passed through to server.NewMCPServer.
 	ServerOptions []server.ServerOption
 }
@@ -221,6 +226,11 @@ func Tools(cfg Config) ([]server.ServerTool, error) {
 				}
 				src := desc.SourceLocations().ByDescriptor(m)
 				var descriptions []string
+				if cfg.MethodDescription != nil {
+					if d := strings.TrimSpace(cfg.MethodDescription(m)); d != "" {
+						descriptions = append(descriptions, d)
+					}
+				}
 				if src.LeadingComments != "" {
 					descriptions = append(descriptions, strings.TrimSpace(src.LeadingComments))
 				}

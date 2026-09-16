@@ -4,12 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"iter"
 	"net/http"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 	"github.com/Basic-Capital/grpcmcp/grpcmcp"
@@ -155,48 +157,80 @@ func buildRegistry(fds *descriptorpb.FileDescriptorSet) *protoregistry.Files {
 	return reg
 }
 
-func hasMethodOption(m protoreflect.MethodDescriptor, fieldNum uint32, expectedValues []uint64) bool {
-	opts := m.Options()
-	if opts == nil {
-		return false
+// skipNextField skips a field's value after its tag has been read.
+func skipNextField(b []byte, number protowire.Number, wireType protowire.Type) ([]byte, error) {
+	valueBytes := protowire.ConsumeFieldValue(number, wireType, b)
+	if valueBytes < 0 {
+		return nil, protowire.ParseError(valueBytes)
 	}
-	b, err := proto.Marshal(opts)
-	if err != nil {
-		return false
-	}
-	for len(b) > 0 {
-		num, wtype, n := protowire.ConsumeTag(b)
-		if n < 0 {
-			return false
+	return b[valueBytes:], nil
+}
+
+type methodOptionField struct {
+	number   protowire.Number
+	wireType protowire.Type
+	value    []byte // Encoded value, including any length prefix, excluding the tag.
+}
+
+// methodOptionFields yields options in wire order, stopping at malformed data
+// or when the caller has found what it needs.
+func methodOptionFields(m protoreflect.MethodDescriptor) iter.Seq[methodOptionField] {
+	return func(yield func(methodOptionField) bool) {
+		opts := m.Options()
+		if opts == nil {
+			return
 		}
-		b = b[n:]
-		if uint32(num) == fieldNum && wtype == protowire.VarintType {
-			v, vn := protowire.ConsumeVarint(b)
-			if vn < 0 {
-				return false
+		b, err := proto.Marshal(opts)
+		if err != nil {
+			return
+		}
+		for len(b) > 0 {
+			number, wireType, startOfValue := protowire.ConsumeTag(b)
+			if startOfValue < 0 {
+				return
 			}
-			return slices.Contains(expectedValues, v)
+			b = b[startOfValue:]
+			rest, err := skipNextField(b, number, wireType)
+			if err != nil {
+				return
+			}
+			field := methodOptionField{
+				number:   number,
+				wireType: wireType,
+				value:    b[:len(b)-len(rest)],
+			}
+			if !yield(field) {
+				return
+			}
+			b = rest
 		}
-		switch wtype {
-		case protowire.VarintType:
-			_, n = protowire.ConsumeVarint(b)
-		case protowire.Fixed32Type:
-			_, n = protowire.ConsumeFixed32(b)
-		case protowire.Fixed64Type:
-			_, n = protowire.ConsumeFixed64(b)
-		case protowire.BytesType:
-			_, n = protowire.ConsumeBytes(b)
-		case protowire.StartGroupType:
-			_, n = protowire.ConsumeGroup(protowire.Number(num), b)
-		default:
-			return false
+	}
+}
+
+func hasMethodOption(m protoreflect.MethodDescriptor, fieldNum uint32, expectedValues []uint64) bool {
+	for field := range methodOptionFields(m) {
+		if uint32(field.number) == fieldNum && field.wireType == protowire.VarintType {
+			value, _ := protowire.ConsumeVarint(field.value)
+			return slices.Contains(expectedValues, value)
 		}
-		if n < 0 {
-			return false
-		}
-		b = b[n:]
 	}
 	return false
+}
+
+// getMethodOptionString returns the value of the string-typed custom method
+// option with the given field number, or "" when the option is absent, not a
+// length-delimited field, or contains invalid UTF-8.
+func getMethodOptionString(m protoreflect.MethodDescriptor, fieldNum uint32) string {
+	for field := range methodOptionFields(m) {
+		if uint32(field.number) == fieldNum && field.wireType == protowire.BytesType {
+			value, _ := protowire.ConsumeBytes(field.value)
+			if !utf8.Valid(value) {
+				return ""
+			}
+			return string(value)
+		}
+	}
+	return ""
 }
 
 func main() {
@@ -214,6 +248,7 @@ func main() {
 	baseURL := flag.String("url", "http://localhost:8090", "The url of the backend")
 	useConnect := flag.Bool("connect", false, "Use connect protocol (instead of gRPC)")
 	requireMethodOption := flag.String("require-method-option", "", "Only expose methods with this option (fieldNumber:value or fieldNumber:value1,value2, e.g. 50003:1 or 50003:1,2)")
+	descriptionMethodOption := flag.Uint("description-method-option", 0, "Field number of a string-typed custom method option whose value is used as the MCP tool description (e.g. 50005). Useful when the backend's reflected descriptors carry no source comments.")
 	forwardOperatorIdentity := flag.Bool("forward-operator-identity", false, "Copy the X-Operator-Identity header from inbound MCP requests onto outbound gRPC calls. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.")
 	var forwardHeaderNames []string
 	flag.Func("forward-header", "Copy a named header from inbound MCP requests onto outbound gRPC calls, if present. Repeatable. The header must be minted by a trusted proxy in front of this server; grpcmcp does not verify it.", func(v string) error {
@@ -378,6 +413,14 @@ func main() {
 
 	toolName := buildToolNamer(descriptorSet, servicesMap, methodFilter)
 
+	var methodDescription func(protoreflect.MethodDescriptor) string
+	if *descriptionMethodOption > 0 {
+		descFieldNum := uint32(*descriptionMethodOption)
+		methodDescription = func(m protoreflect.MethodDescriptor) string {
+			return getMethodOptionString(m, descFieldNum)
+		}
+	}
+
 	headersProvider := grpcmcp.StaticHeaders(http.Header(headers))
 	if *forwardOperatorIdentity {
 		headersProvider = operatorIdentityHeaders(headersProvider)
@@ -400,18 +443,19 @@ func main() {
 	}
 
 	cfg := grpcmcp.Config{
-		Headers:       headersProvider,
-		ServerName:    *serverName,
-		Version:       *serverVersion,
-		Descriptors:   descriptorSet,
-		Services:      serviceNames,
-		BaseURL:       *baseURL,
-		HTTPClient:    backendClient,
-		UseConnect:    *useConnect,
-		String64:      *string64,
-		MethodFilter:  methodFilter,
-		ToolName:      toolName,
-		ServerOptions: serverOptions,
+		Headers:           headersProvider,
+		ServerName:        *serverName,
+		Version:           *serverVersion,
+		Descriptors:       descriptorSet,
+		Services:          serviceNames,
+		BaseURL:           *baseURL,
+		HTTPClient:        backendClient,
+		UseConnect:        *useConnect,
+		String64:          *string64,
+		MethodFilter:      methodFilter,
+		ToolName:          toolName,
+		MethodDescription: methodDescription,
+		ServerOptions:     serverOptions,
 	}
 	srv, err := grpcmcp.NewServer(cfg)
 	if err != nil {
