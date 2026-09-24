@@ -94,6 +94,15 @@ holds every tool name in its context:
 The scan that finds these collisions counts only the methods grpcmcp exposes, so
 `services` and `require-method-option` change which names collide.
 
+### Tool annotations
+
+grpcmcp sets MCP tool hints from each method's standard `idempotency_level`
+option, so clients can tell reads from writes:
+
+* `NO_SIDE_EFFECTS` - `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`.
+* `IDEMPOTENT` - `readOnlyHint: false`, `idempotentHint: true`.
+* Unset or `IDEMPOTENCY_UNKNOWN` - no hints. MCP clients treat such a tool as a possibly destructive write.
+
 ### TLS
 
 These options apply to the backend connection. They are ignored when `url` is `http://`.

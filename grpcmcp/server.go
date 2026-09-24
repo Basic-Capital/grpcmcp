@@ -245,8 +245,10 @@ func Tools(cfg Config) ([]server.ServerTool, error) {
 				if cfg.ToolName != nil {
 					name = cfg.ToolName(s, m)
 				}
+				tool := mcp.NewToolWithRawSchema(name, description, rawJSON)
+				tool.Annotations = toolAnnotations(m)
 				tools = append(tools, server.ServerTool{
-					Tool:    mcp.NewToolWithRawSchema(name, description, rawJSON),
+					Tool:    tool,
 					Handler: toolHandler(c, m.Input(), cfg.Headers),
 				})
 			}
@@ -254,6 +256,29 @@ func Tools(cfg Config) ([]server.ServerTool, error) {
 	}
 
 	return tools, nil
+}
+
+// toolAnnotations maps the standard idempotency_level method option onto MCP
+// tool hints, so clients can tell reads from writes. Methods without the
+// option get no hints, which MCP clients treat as a potentially destructive
+// write.
+func toolAnnotations(m protoreflect.MethodDescriptor) mcp.ToolAnnotation {
+	opts, _ := m.Options().(*descriptorpb.MethodOptions)
+	switch opts.GetIdempotencyLevel() {
+	case descriptorpb.MethodOptions_NO_SIDE_EFFECTS:
+		return mcp.ToolAnnotation{
+			ReadOnlyHint:    mcp.ToBoolPtr(true),
+			DestructiveHint: mcp.ToBoolPtr(false),
+			IdempotentHint:  mcp.ToBoolPtr(true),
+		}
+	case descriptorpb.MethodOptions_IDEMPOTENT:
+		return mcp.ToolAnnotation{
+			ReadOnlyHint:   mcp.ToBoolPtr(false),
+			IdempotentHint: mcp.ToBoolPtr(true),
+		}
+	default:
+		return mcp.ToolAnnotation{}
+	}
 }
 
 func toolHandler(c *connect.Client[dynamicpb.Message, dynamicpb.Message], desc protoreflect.MessageDescriptor, headers ToolHeaderProvider) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
