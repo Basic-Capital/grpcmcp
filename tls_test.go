@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -258,8 +260,18 @@ func TestBackendTLSClient(t *testing.T) {
 			t.Fatalf("backendTLSClient: %v", err)
 		}
 		transport := c.(*http.Client).Transport.(*http.Transport)
-		if len(transport.TLSClientConfig.Certificates) != 1 {
-			t.Error("expected one client certificate")
+		if transport.TLSClientConfig.GetClientCertificate == nil {
+			t.Fatal("GetClientCertificate is not set, so no client certificate is sent")
+		}
+		cert, err := transport.TLSClientConfig.GetClientCertificate(&tls.CertificateRequestInfo{})
+		if err != nil || cert == nil {
+			t.Fatalf("GetClientCertificate = %v, %v; want a certificate", cert, err)
+		}
+	})
+
+	t.Run("bad key path is an error at startup", func(t *testing.T) {
+		if _, err := backendTLSClient("", certPath, filepath.Join(t.TempDir(), "absent.pem")); err == nil {
+			t.Fatal("expected an error for a missing key file")
 		}
 	})
 
@@ -284,4 +296,386 @@ func TestBackendTLSClient(t *testing.T) {
 			t.Fatal("expected an error for a missing CA file")
 		}
 	})
+}
+
+func copyFile(t *testing.T, src string, dst string, mod time.Time) {
+	t.Helper()
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read %s: %v", src, err)
+	}
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		t.Fatalf("write %s: %v", dst, err)
+	}
+	if err := os.Chtimes(dst, mod, mod); err != nil {
+		t.Fatalf("chtimes %s: %v", dst, err)
+	}
+}
+
+func TestCertReloaderPicksUpRotatedCertificate(t *testing.T) {
+	oldCert, oldKey, _ := writeSelfSignedCert(t)
+	newCert, newKey, _ := writeSelfSignedCert(t)
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+	start := time.Now().Add(-time.Hour)
+	copyFile(t, oldCert, certPath, start)
+	copyFile(t, oldKey, keyPath, start)
+
+	r, err := newCertReloader(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	before, err := r.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("GetClientCertificate: %v", err)
+	}
+
+	rotated := start.Add(time.Minute)
+	copyFile(t, newCert, certPath, rotated)
+	copyFile(t, newKey, keyPath, rotated)
+
+	after, err := r.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("GetClientCertificate after rotation: %v", err)
+	}
+	want, err := tls.LoadX509KeyPair(newCert, newKey)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair: %v", err)
+	}
+	if string(after.Certificate[0]) == string(before.Certificate[0]) {
+		t.Fatal("the reloader kept the old certificate after the files changed")
+	}
+	if string(after.Certificate[0]) != string(want.Certificate[0]) {
+		t.Fatal("the reloader did not return the rotated certificate")
+	}
+}
+
+func TestCertReloaderKeepsLastCertificateWhenFilesDisappear(t *testing.T) {
+	srcCert, srcKey, _ := writeSelfSignedCert(t)
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+	now := time.Now()
+	copyFile(t, srcCert, certPath, now)
+	copyFile(t, srcKey, keyPath, now)
+
+	r, err := newCertReloader(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	before, err := r.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("GetClientCertificate: %v", err)
+	}
+
+	if err := os.Remove(certPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	after, err := r.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("GetClientCertificate with the file absent: %v", err)
+	}
+	if string(after.Certificate[0]) != string(before.Certificate[0]) {
+		t.Fatal("expected the previous certificate while the file is absent")
+	}
+}
+
+func TestCertReloaderLogsARepeatedFailureOnce(t *testing.T) {
+	srcCert, srcKey, _ := writeSelfSignedCert(t)
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+	start := time.Now().Add(-time.Hour)
+	copyFile(t, srcCert, certPath, start)
+	copyFile(t, srcKey, keyPath, start)
+
+	r, err := newCertReloader(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	var log bytes.Buffer
+	r.log = &log
+	lines := func() int { return strings.Count(log.String(), "\n") }
+
+	if err := os.Remove(certPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	for range 3 {
+		if _, err := r.GetCertificate(&tls.ClientHelloInfo{}); err != nil {
+			t.Fatalf("GetCertificate: %v", err)
+		}
+	}
+	if lines() != 1 {
+		t.Fatalf("logged %d lines for one sustained failure, want 1:\n%s", lines(), log.String())
+	}
+
+	copyFile(t, srcCert, certPath, start.Add(time.Minute))
+	if _, err := r.GetCertificate(&tls.ClientHelloInfo{}); err != nil {
+		t.Fatalf("GetCertificate after recovery: %v", err)
+	}
+	if err := os.Remove(certPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, err := r.GetCertificate(&tls.ClientHelloInfo{}); err != nil {
+		t.Fatalf("GetCertificate: %v", err)
+	}
+	if lines() != 2 {
+		t.Fatalf("logged %d lines, want 2 after a recovery and a new failure:\n%s", lines(), log.String())
+	}
+}
+
+type blockingWriter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.entered <- struct{}{}
+	<-w.release
+	return len(p), nil
+}
+
+func TestCertReloaderDoesNotHoldTheLockWhileItLogs(t *testing.T) {
+	oldCert, oldKey, _ := writeSelfSignedCert(t)
+	newCert, newKey, _ := writeSelfSignedCert(t)
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+	start := time.Now().Add(-time.Hour)
+	copyFile(t, oldCert, certPath, start)
+	copyFile(t, oldKey, keyPath, start)
+
+	r, err := newCertReloader(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	w := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	r.log = w
+	defer close(w.release)
+
+	rotated := start.Add(time.Minute)
+	copyFile(t, newCert, certPath, rotated)
+	copyFile(t, newKey, keyPath, rotated)
+
+	go func() { _, _ = r.GetCertificate(&tls.ClientHelloInfo{}) }()
+	select {
+	case <-w.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rotation did not write a log line")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.GetClientCertificate(&tls.CertificateRequestInfo{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("GetClientCertificate: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a handshake waited for a blocked log write")
+	}
+}
+
+func TestCertReloaderDoesNotFallBackToAnExpiredCertificate(t *testing.T) {
+	srcCert, srcKey, _ := writeSelfSignedCert(t)
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+	now := time.Now()
+	copyFile(t, srcCert, certPath, now)
+	copyFile(t, srcKey, keyPath, now)
+
+	r, err := newCertReloader(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	r.now = func() time.Time { return now.Add(2 * time.Hour) }
+	var log bytes.Buffer
+	r.log = &log
+
+	if err := os.Remove(certPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	cert, err := r.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err == nil {
+		t.Fatalf("GetClientCertificate = %v; want an error, not an expired certificate", cert)
+	}
+	if strings.Contains(err.Error(), dir) {
+		t.Errorf("the handshake error %q contains the certificate path, which a caller can see", err)
+	}
+	if !strings.Contains(log.String(), certPath) || !strings.Contains(log.String(), "expired") {
+		t.Errorf("the log %q does not give the path and the expiry", log.String())
+	}
+}
+
+func TestLoadKeyPairSetsLeafWhenGODEBUGDisablesIt(t *testing.T) {
+	certPath, keyPath, _ := writeSelfSignedCert(t)
+
+	plain, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair: %v", err)
+	}
+	if plain.Leaf != nil {
+		t.Skip("LoadX509KeyPair set Leaf; run with GODEBUG=x509keypairleaf=0 at process start on Go 1.23 to 1.26 to test a nil Leaf")
+	}
+
+	r, err := newCertReloader(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	cert, err := r.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("GetCertificate: %v", err)
+	}
+	if cert.Leaf == nil {
+		t.Fatal("Leaf is nil, so the expiry checks would panic")
+	}
+}
+
+func TestServeTLSPicksUpRotatedCertificate(t *testing.T) {
+	oldCert, oldKey, oldCA := writeSelfSignedCert(t)
+	newCert, newKey, newCA := writeSelfSignedCert(t)
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+	start := time.Now().Add(-time.Hour)
+	copyFile(t, oldCert, certPath, start)
+	copyFile(t, oldKey, keyPath, start)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	go func() {
+		_ = serveTLS(handler, addr, "", certPath, keyPath)
+	}()
+
+	pool := x509.NewCertPool()
+	for _, path := range []string{oldCA, newCA} {
+		pems, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		pool.AppendCertsFromPEM(pems)
+	}
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig:   &tls.Config{RootCAs: pool},
+		DisableKeepAlives: true,
+	}}
+
+	served := func() []byte {
+		t.Helper()
+		var resp *http.Response
+		var err error
+		for range 50 {
+			resp, err = client.Get("https://" + addr + "/")
+			if err == nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if err != nil {
+			t.Fatalf("HTTPS request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.TLS.PeerCertificates[0].Raw
+	}
+
+	want, err := tls.LoadX509KeyPair(oldCert, oldKey)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair: %v", err)
+	}
+	if string(served()) != string(want.Certificate[0]) {
+		t.Fatal("the server did not serve the initial certificate")
+	}
+
+	rotated := start.Add(time.Minute)
+	copyFile(t, newCert, certPath, rotated)
+	copyFile(t, newKey, keyPath, rotated)
+
+	want, err = tls.LoadX509KeyPair(newCert, newKey)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair: %v", err)
+	}
+	if string(served()) != string(want.Certificate[0]) {
+		t.Fatal("the server kept the old certificate after the files changed")
+	}
+}
+
+func TestCertReloaderFollowsKubernetesSecretVolumeSwap(t *testing.T) {
+	oldCert, oldKey, _ := writeSelfSignedCert(t)
+	newCert, newKey, _ := writeSelfSignedCert(t)
+
+	mount := t.TempDir()
+	writeVersion := func(name string, cert string, key string, mod time.Time) {
+		t.Helper()
+		dir := filepath.Join(mount, name)
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		copyFile(t, cert, filepath.Join(dir, "tls.crt"), mod)
+		copyFile(t, key, filepath.Join(dir, "tls.key"), mod)
+	}
+	swapData := func(target string) {
+		t.Helper()
+		tmp := filepath.Join(mount, "..data_tmp")
+		if err := os.Symlink(target, tmp); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if err := os.Rename(tmp, filepath.Join(mount, "..data")); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+	}
+
+	writeVersion("..2026_10_02_19_13_21.1", oldCert, oldKey, time.Now().Add(-time.Hour))
+	swapData("..2026_10_02_19_13_21.1")
+	for _, name := range []string{"tls.crt", "tls.key"} {
+		if err := os.Symlink(filepath.Join("..data", name), filepath.Join(mount, name)); err != nil {
+			t.Fatalf("symlink %s: %v", name, err)
+		}
+	}
+	certPath := filepath.Join(mount, "tls.crt")
+	keyPath := filepath.Join(mount, "tls.key")
+
+	r, err := newCertReloader(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	before, err := r.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("GetClientCertificate: %v", err)
+	}
+
+	writeVersion("..2026_10_08_03_12_31.2", newCert, newKey, time.Now())
+	swapData("..2026_10_08_03_12_31.2")
+	if err := os.RemoveAll(filepath.Join(mount, "..2026_10_02_19_13_21.1")); err != nil {
+		t.Fatalf("remove old version: %v", err)
+	}
+
+	after, err := r.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("GetClientCertificate after the swap: %v", err)
+	}
+	want, err := tls.LoadX509KeyPair(newCert, newKey)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair: %v", err)
+	}
+	if string(after.Certificate[0]) == string(before.Certificate[0]) {
+		t.Fatal("the reloader kept the old certificate after the ..data symlink swap")
+	}
+	if string(after.Certificate[0]) != string(want.Certificate[0]) {
+		t.Fatal("the reloader did not return the certificate from the new version directory")
+	}
 }
