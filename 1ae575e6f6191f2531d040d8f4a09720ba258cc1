@@ -1,0 +1,28 @@
+example/echo.go
+  s_96dd33ab2668b5::t_fef4d20f4c4bae 1-119
+.github/workflows/ci.yaml
+  s_96dd33ab2668b5::t_5e313a3b5163ed 34-35
+scripts/e2e_test.sh
+  s_96dd33ab2668b5::t_385fecd6ebd6bc 62-71
+  s_96dd33ab2668b5::t_91632b960ca5b8 1-48,50-60,72-106
+  s_96dd33ab2668b5::t_48a38e256c5d70 49
+  s_96dd33ab2668b5::t_e86955eefb7120 61
+example/main.go
+  s_96dd33ab2668b5::t_dfb669b7bc1c84 15,19-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1ae575e6f6191f2531d040d8f4a09720ba258cc1",
+  "prompts": {},
+  "sessions": {
+    "s_96dd33ab2668b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe57692f-d675-458a-92b9-61b8260b1c49",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": null
+    }
+  }
+}

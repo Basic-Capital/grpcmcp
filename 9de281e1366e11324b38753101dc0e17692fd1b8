@@ -1,0 +1,39 @@
+forward_header_test.go
+  s_96dd33ab2668b5::t_920bbc0a8ee78d 1-48
+forward_header_flag_validation_test.go
+  s_96dd33ab2668b5::t_db3901e0b21577 10-31,46-48,51-53,77-81,106-110,134-135,138
+  s_96dd33ab2668b5::t_72ea2dfa99605f 1-6,8-9,32-45,50,54-76,82-105,111-133,136-137,139
+  s_96dd33ab2668b5::t_39aee46b6c6c26 7
+  s_96dd33ab2668b5::t_2ba88fa4ac785c 49
+example/echo.go
+  s_96dd33ab2668b5::t_1742f5b6853463 113-120
+scripts/e2e_test.sh
+  s_96dd33ab2668b5::t_7ebeca34c8d7ca 30
+  s_96dd33ab2668b5::t_88ee57fcc24f97 31
+  s_96dd33ab2668b5::t_81fd00135485a6 52-56,60
+  s_96dd33ab2668b5::t_97edae10956dfe 99-117
+main.go
+  s_96dd33ab2668b5::t_5177e1460ab83e 385-387
+  s_96dd33ab2668b5::t_bd73cfe51a0489 274-281,328-336,339-342
+  s_96dd33ab2668b5::t_48739618f774b8 218-222
+  s_96dd33ab2668b5::t_c670a8aa280158 47-69
+  s_96dd33ab2668b5::t_f56d4d1892f8ed 337-338,343-344
+README.md
+  s_96dd33ab2668b5::t_a0eb80e91b7a7f 75-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9de281e1366e11324b38753101dc0e17692fd1b8",
+  "prompts": {},
+  "sessions": {
+    "s_96dd33ab2668b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe57692f-d675-458a-92b9-61b8260b1c49",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": null
+    }
+  }
+}
