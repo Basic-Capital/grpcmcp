@@ -1,0 +1,38 @@
+tls.go
+  s_55a3f8b5b7a34e::t_c8988037c574a5 180-182
+  s_55a3f8b5b7a34e::t_2ff316e13abaf0 57
+  s_55a3f8b5b7a34e::t_46c455ed637383 130,167-171,183
+  s_55a3f8b5b7a34e::t_da525709ef5037 77-78,87-88,92-96,106-117,120,126,132-139
+  s_55a3f8b5b7a34e::t_26b49e1796994b 80-86,90
+  s_55a3f8b5b7a34e::t_2f8144d1358699 7
+  s_55a3f8b5b7a34e::t_22a5125a81e8cc 10-11
+  s_55a3f8b5b7a34e::t_520e397f429e3d 121-125,129,131
+  s_55a3f8b5b7a34e::t_ac68e48aeb24cb 178-179
+  s_55a3f8b5b7a34e::t_af486d352fb3f4 59,61
+  s_55a3f8b5b7a34e::t_6072f6e2212cec 76,79,89,91,97-105,118-119,127-128
+tls_test.go
+  s_55a3f8b5b7a34e::t_4d3afb0fcfa031 300-381
+  s_55a3f8b5b7a34e::t_16f4d3c86fd748 385-428
+  s_55a3f8b5b7a34e::t_832f6a89a4e200 16
+  s_55a3f8b5b7a34e::t_0e640479f77a71 4
+  s_55a3f8b5b7a34e::t_482fbb4e5a3c87 429-527
+  s_55a3f8b5b7a34e::t_abd252917ebf62 263-274
+  s_55a3f8b5b7a34e::t_d9da1f9141b75f 382-383,528-593
+  s_55a3f8b5b7a34e::t_d09bbd1dc95701 384
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cb4dd5862a3f38ffeba2f28ca581f2668798d559",
+  "prompts": {},
+  "sessions": {
+    "s_55a3f8b5b7a34e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6f4045f-365f-40db-88d0-e48922b5e0fa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
